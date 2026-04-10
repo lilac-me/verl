@@ -297,7 +297,7 @@ class vLLMHttpServer:
                 dcp_size,
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
-
+        # print(f"%%%%%%%%%%%%%%%%%% **load_format: {self.config.load_format}")
         compilation_config = json.dumps(compilation_config)
         args = {
             "dtype": self.config.dtype,
@@ -426,6 +426,10 @@ class vLLMHttpServer:
         server_args.model = server_args.model_tag
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
+        
+        # print(f"####################################&&& server_args:{server_args}")
+
+        # print(f"####################################&&& server_args:{os.environ}")
 
         # 3. launch server
         if self.node_rank == 0:
@@ -633,10 +637,13 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.HYBRID:
             # Don't use engine.sleep(level=2) here
             # lora only update adapter weights, so set sleep level to 1
-            if self.lora_as_adapter:
-                sleep_level = 1
-            else:
-                sleep_level = 2
+
+            # if self.lora_as_adapter:
+            #     sleep_level = 1
+            # else:
+            #     sleep_level = 2
+            
+            sleep_level = 1
             await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
 
             # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452

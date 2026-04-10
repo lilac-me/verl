@@ -523,7 +523,8 @@ def offload_megatron_copy_params(optimizers):
     def offload_tensor_to_cpu(tensor):
         if tensor is None:
             return
-        tensor.data = tensor.data.to("cpu", non_blocking=True)
+        tensor.data = tensor.data.to("cpu", non_blocking=False)
+        # tensor.data = tensor.data.to("cpu", non_blocking=True)
 
     def offload_group_to_cpu(group):
         if group is None:

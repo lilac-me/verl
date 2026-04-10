@@ -249,12 +249,13 @@ class BucketedWeightReceiver:
                     tensor = self.buffer[offset : offset + size].view(dtype=dtype).view(shape)
                     if not self.use_shm:
                         tensor = tensor.clone()
-                    else:
+                    if self.use_shm:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
+                on_bucket_received(weights)
                 get_torch_device().synchronize()
                 self.socket.send(b"")
-                on_bucket_received(weights)
+                # on_bucket_received(weights)
                 del weights, tensor
                 if metadata["is_last"]:
                     break

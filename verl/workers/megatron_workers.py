@@ -420,6 +420,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
             self.tf_config = updated_tf_config
             print(f"actor_module: {len(actor_module)}")
+            # self.config.actor.load_weight = False
             if self.config.actor.load_weight:
                 if self.config.actor.megatron.use_dist_checkpointing:
                     load_mcore_dist_weights(
@@ -459,6 +460,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 override_model_config=override_model_config,
             )
             self.tf_config = updated_tf_config
+            # self.config.ref.load_weight = False
             if self.config.ref.load_weight:  # should align with the actor:
                 assert self.config.actor.load_weight == self.config.ref.load_weight
                 print("load ref weight start")

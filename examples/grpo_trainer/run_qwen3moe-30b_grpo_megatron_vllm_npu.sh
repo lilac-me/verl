@@ -11,14 +11,14 @@ NNODES=${NNODES:-1}
 NPUS_PER_NODE=${NPUS_PER_NODE:-16}
 
 # Model Weights Paths
-MODEL_PATH=Qwen/Qwen3-30B-A3B-Base
+MODEL_PATH=/home/g00841271/Qwen3-Coder-30B-A3B-Instruct
 MCORE_MODEL_PATH=Qwen/Qwen3-30B-A3B-Base-dist
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 
 # File System Paths
-TRAIN_FILE=$RAY_DATA_HOME/dataset/gsm8k/train.parquet
-TEST_FILE=$RAY_DATA_HOME/dataset/gsm8k/test.parquet
+TRAIN_FILE=/home/c00937190/dapo-math-17k.jsonl
+TEST_FILE=/home/g00841271/datasets/HuggingFaceH4/aime_2024/train-00000-of-00001.parquet
 
 # Data Configuration
 max_prompt_length=$((1024 * 1))
