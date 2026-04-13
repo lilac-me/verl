@@ -22,6 +22,7 @@ import time
 
 import psutil
 import torch
+import torch_npu
 import torch.distributed
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf
@@ -373,6 +374,183 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "`log_prob_micro_batch_size` should not be None at the same time."
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
+        self._update_actor_count = 0
+        self._rollout_count = 0
+        self._rollout_in_step = 0
+
+    def _diag_snapshot(self, tag: str):
+        """Root-cause diagnostic: allocator stats + full tensor census +
+        cross-step diff + referrer chain trace.
+        Only runs on rank 0."""
+        if torch.distributed.get_rank() != 0:
+            return
+        import gc as _gc
+        import types as _types
+        _gc.collect()
+        torch.npu.synchronize()
+        step = self._update_actor_count
+
+        # ── 1. Allocator internal stats ──
+        try:
+            stats = torch_npu.npu.memory_stats()
+        except Exception:
+            stats = {}
+        seg_cur    = stats.get('segment.all.current', -1)
+        act_blocks = stats.get('active.all.current', -1)
+        act_bytes  = stats.get('active_bytes.all.current', 0)
+        inact_sp   = stats.get('inactive_split.all.current', -1)
+        inact_bytes = stats.get('inactive_split_bytes.all.current', 0)
+        reserved   = stats.get('reserved_bytes.all.current', 0)
+        allocated  = stats.get('allocated_bytes.all.current', 0)
+
+        print(f"\n{'='*90}")
+        print(f"[DIAG] {tag} | step={step}")
+        print(f"  Allocator: segments={seg_cur}  active_blocks={act_blocks}  "
+              f"inactive_splits={inact_sp}")
+        print(f"  Bytes: active={act_bytes/1e6:.1f}MB  "
+              f"inactive_split={inact_bytes/1e6:.1f}MB  "
+              f"reserved={reserved/1e9:.3f}GB  allocated={allocated/1e9:.3f}GB")
+
+        # ── 2. Full GPU tensor census (deduplicated by storage data_ptr) ──
+        storage_map = {}
+        for obj in _gc.get_objects():
+            if not isinstance(obj, torch.Tensor):
+                continue
+            if not obj.is_npu:
+                continue
+            try:
+                st = obj.storage()
+                sz = st.size() * obj.element_size()
+                ptr = st.data_ptr()
+            except Exception:
+                continue
+            if sz == 0:
+                continue
+            if ptr not in storage_map or storage_map[ptr][0] < sz:
+                storage_map[ptr] = (sz, tuple(obj.shape), str(obj.dtype), obj)
+
+        unique_bytes = sum(v[0] for v in storage_map.values())
+        hidden = max(0, allocated - unique_bytes)
+        print(f"  GC-visible: {len(storage_map)} unique storages = "
+              f"{unique_bytes/1e6:.1f}MB")
+        print(f"  proc_alloc={allocated/1e6:.1f}MB vs gc_visible="
+              f"{unique_bytes/1e6:.1f}MB => hidden={hidden/1e6:.1f}MB")
+
+        # ── 3. Group by (shape, dtype) ──
+        group = {}
+        for ptr, (sz, shape, dtype, _) in storage_map.items():
+            key = (shape, dtype)
+            if key not in group:
+                group[key] = [0, 0, []]
+            group[key][0] += 1
+            group[key][1] += sz
+            group[key][2].append(ptr)
+
+        sorted_groups = sorted(group.items(), key=lambda x: -x[1][1])
+        print(f"\n  [CENSUS] Top GPU tensor groups ({len(group)} types):")
+        for (shape, dtype), (cnt, total_sz, _) in sorted_groups[:25]:
+            print(f"    shape={str(shape):35s} dtype={dtype:15s} "
+                  f"each={total_sz/cnt/1e6:8.2f}MB x{cnt} = {total_sz/1e6:.1f}MB")
+
+        # ── 4. Cross-step diff (same tag, step1 as baseline) ──
+        if not hasattr(self, '_diag_baselines'):
+            self._diag_baselines = {}
+        cur_fp = {k: (v[0], v[1]) for k, v in group.items()}
+
+        if tag in self._diag_baselines:
+            base = self._diag_baselines[tag]
+            new_g, grown_g, gone_g = [], [], []
+            for k, (cnt, sz) in cur_fp.items():
+                if k not in base:
+                    new_g.append((k, cnt, sz))
+                elif cnt > base[k][0]:
+                    grown_g.append((k, base[k][0], cnt, base[k][1], sz))
+            for k, (cnt, sz) in base.items():
+                if k not in cur_fp:
+                    gone_g.append((k, cnt, sz))
+
+            delta_bytes = sum(sz for _, _, sz in new_g) + \
+                          sum(nsz - osz for _, _, _, osz, nsz in grown_g)
+            print(f"\n  [DIFF vs step1] new_types={len(new_g)}  "
+                  f"grown={len(grown_g)}  disappeared={len(gone_g)}  "
+                  f"delta~={delta_bytes/1e6:.1f}MB")
+            for k, cnt, sz in sorted(new_g, key=lambda x: -x[2])[:15]:
+                print(f"    NEW:  shape={str(k[0]):35s} dtype={k[1]:15s} "
+                      f"x{cnt} = {sz/1e6:.1f}MB")
+            for k, oc, nc, osz, nsz in sorted(grown_g,
+                                               key=lambda x: -(x[4]-x[3]))[:15]:
+                print(f"    GROW: shape={str(k[0]):35s} dtype={k[1]:15s} "
+                      f"x{oc}->{nc} ({osz/1e6:.1f}->{nsz/1e6:.1f}MB)")
+            for k, cnt, sz in sorted(gone_g, key=lambda x: -x[2])[:5]:
+                print(f"    GONE: shape={str(k[0]):35s} dtype={k[1]:15s} "
+                      f"x{cnt} = {sz/1e6:.1f}MB")
+        else:
+            print(f"\n  [DIFF] step1 baseline recorded for tag='{tag}'")
+            self._diag_baselines[tag] = cur_fp
+
+        # ── 5. Referrer trace (step >= 2): who holds the top tensors? ──
+        if step >= 2:
+            print(f"\n  [REFERRERS] Top tensors by size (tracing holders):")
+            sorted_st = sorted(storage_map.values(), key=lambda x: -x[0])
+            for i, (sz, shape, dtype, tref) in enumerate(sorted_st[:15]):
+                raw_refs = _gc.get_referrers(tref)
+                ref_info = []
+                for r in raw_refs:
+                    if isinstance(r, _types.FrameType):
+                        continue
+                    if r is storage_map:
+                        continue
+                    if isinstance(r, dict):
+                        keys = [rk for rk, rv in list(r.items())[:200]
+                                if rv is tref]
+                        if keys:
+                            owners = _gc.get_referrers(r)
+                            owner_names = []
+                            for o in owners[:3]:
+                                if isinstance(o, _types.FrameType):
+                                    continue
+                                if hasattr(o, '__class__'):
+                                    owner_names.append(
+                                        type(o).__qualname__)
+                            ref_info.append(
+                                f"dict[{keys}]->"
+                                f"{'|'.join(owner_names) if owner_names else '?'}")
+                        else:
+                            ref_info.append(f"dict(len={len(r)})")
+                    elif isinstance(r, list):
+                        owners = _gc.get_referrers(r)
+                        owner_names = [type(o).__qualname__
+                                       for o in owners[:3]
+                                       if not isinstance(o, (_types.FrameType,
+                                                             list, dict, tuple))]
+                        ref_info.append(
+                            f"list(len={len(r)})->"
+                            f"{'|'.join(owner_names) if owner_names else '?'}")
+                    elif isinstance(r, tuple):
+                        ref_info.append(f"tuple(len={len(r)})")
+                    else:
+                        ref_info.append(
+                            f"{type(r).__module__}.{type(r).__qualname__}")
+                    if len(ref_info) >= 4:
+                        break
+                print(f"    [{i}] shape={shape} dtype={dtype} "
+                      f"size={sz/1e6:.1f}MB")
+                print(f"        held_by: {ref_info}")
+
+        print(f"{'='*90}\n")
+
+    def _debug_mem(self, tag: str):
+        """Print both device-level and process-level GPU memory for debugging."""
+        free, tot = torch.npu.mem_get_info()
+        dev_used = (tot - free) / 1e9
+        proc_alloc = torch_npu.npu.memory_allocated() / 1e9
+        proc_reserved = torch_npu.npu.memory_reserved() / 1e9
+        print(
+            f"[DEBUG MEM] {tag} | gstep={self._update_actor_count} "
+            f"rollout={self._rollout_in_step} rank={self.rank} "
+            f"dev_used={dev_used:.2f}GB dev_free={free/1e9:.2f}GB | "
+            f"proc_alloc={proc_alloc:.2f}GB proc_reserved={proc_reserved:.2f}GB"
+        )
 
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
@@ -681,23 +859,27 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        self._rollout_count += 1
+        self._rollout_in_step += 1
+        self._debug_mem("rollout-A  enter")
+
+        # if torch.distributed.get_rank() == 0:
+        #     torch_npu.npu.memory._record_memory_history(context='all', stacks='python')
         aggressive_empty_cache(force_sync=True)
+        self._debug_mem("rollout-B  after_empty_cache")
+
         set_expandable_segments(False)
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
+            self._debug_mem("rollout-C  after_load_param(no_grad)")
             log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
 
-        # Build peft_config for vLLM LoRA support
         peft_config = None
         do_lora_base_sync = False
         if not self.peft_merge and self.peft_cls is not None:
             peft_config = build_peft_config_for_vllm(self.config.model.get("lora", {}))
-            # set sleep level for LoRA adapter weights only sync
-            # TODO: make this configurable so that users with small
-            # main memory can trade sync time to avoid OOM
             self.rollout.sleep_level = 1
-
             do_lora_base_sync = (not self.base_sync_done) or (
                 self.rollout.sleep_level != 1 and self.config.rollout.free_cache_engine
             )
@@ -706,7 +888,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.vanilla_bridge:
                 per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
             elif not self.peft_merge and self.peft_cls is not None:
-                # Only export adapter weights
                 per_tensor_param = self.bridge.export_adapter_weights(self.actor.actor_module)
             else:
                 per_tensor_param = self.bridge.export_hf_weights(self.actor.actor_module)
@@ -721,8 +902,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
+            self._debug_mem("rollout-D  after_resume(weights)")
         if do_lora_base_sync:
-            # Base layer sync
             per_tensor_param_lora_base = self.bridge.export_hf_weights(
                 self.actor.actor_module, merge_adapter_weights=False
             )
@@ -731,29 +912,45 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 peft_config=peft_config,
                 base_sync_done=False,
             )
-
-            # Mark base sync as done after first successful sync
             self.base_sync_done = True
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        self._debug_mem("rollout-E0 after_update_weights")
+
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
+            self._debug_mem("rollout-E  after_offload_param")
         aggressive_empty_cache(force_sync=True)
+        self._debug_mem("rollout-F  after_empty_cache2")
+
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
+            self._debug_mem("rollout-G  after_resume(kv_cache)")
 
-        set_expandable_segments(True)
+        set_expandable_segments(True)  # 暂时关闭，排查是否导致大 segment 碎片化
+        # if torch.distributed.get_rank() == 0:
+        #     torch_npu.npu.memory._dump_snapshot(f"/home/g00841271/rllm-071/rollout_{self._update_actor_count}_{self._rollout_count}.pickle")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
+        self._update_actor_count += 1
+        self._rollout_in_step = 0
+        # if torch.distributed.get_rank() == 0:
+        #     torch_npu.npu.memory._record_memory_history(context='all', stacks='python')
         assert self._is_actor
+
+        self._debug_mem("actor-A0 enter")
+        self._diag_snapshot("actor-A0")
+
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
+            self._debug_mem("actor-A  after_load_param(+grad)")
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
+            self._debug_mem("actor-B  after_load_optimizer")
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
@@ -761,6 +958,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         dataloader = self.actor.make_minibatch_iterator(data=data)
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader)
+
+        self._debug_mem("actor-B2 after_update_policy")
+
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         images_seqlens = data.meta_info.get("images_seqlens", None)
@@ -776,18 +976,43 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
         self.actor_optimizer_scheduler.step(1)
 
-        # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
+        # --- 清理 TE / Megatron 残留 buffer，防止碎片 pin 住整个 reserved segment ---
+        try:
+            from transformer_engine.pytorch.module.base import _dummy_wgrads
+            n_cleared = len(_dummy_wgrads)
+            _dummy_wgrads.clear()
+            if torch.distributed.get_rank() == 0:
+                print(f"[DEBUG CLEAN] cleared {n_cleared} TE _dummy_wgrads")
+        except ImportError:
+            pass
+        try:
+            from megatron.core.tensor_parallel.random import get_global_memory_buffer
+            buf = get_global_memory_buffer()
+            n_buf = len(buf.buffer)
+            buf.buffer.clear()
+            if torch.distributed.get_rank() == 0:
+                print(f"[DEBUG CLEAN] cleared {n_buf} Megatron global_memory_buffer entries")
+        except Exception:
+            pass
+
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
+            self._debug_mem("actor-C  after_offload_param")
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
+            self._debug_mem("actor-D  after_offload_optimizer")
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         aggressive_empty_cache(force_sync=True)
+        self._debug_mem("actor-E  after_empty_cache")
+        self._diag_snapshot("actor-E")
+
+        # if torch.distributed.get_rank() == 0:
+        #     torch_npu.npu.memory._dump_snapshot(f"/home/g00841271/rllm-071/actor_{self._update_actor_count}.pickle")
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))

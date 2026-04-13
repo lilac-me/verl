@@ -638,12 +638,12 @@ class vLLMHttpServer:
             # Don't use engine.sleep(level=2) here
             # lora only update adapter weights, so set sleep level to 1
 
-            # if self.lora_as_adapter:
-            #     sleep_level = 1
-            # else:
-            #     sleep_level = 2
+            if self.lora_as_adapter:
+                sleep_level = 1
+            else:
+                sleep_level = 2
             
-            sleep_level = 1
+            # sleep_level = 1
             await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
 
             # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452

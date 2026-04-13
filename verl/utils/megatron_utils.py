@@ -416,6 +416,29 @@ def mcore_model_parallel_config(
     )
 
 
+def _offload_model_remaining_buffers(models):
+    """Offload all non-parameter GPU tensors (registered buffers, RoPE cache, etc.)
+    that offload_megatron_model_to_cpu does NOT handle."""
+    import gc as _gc
+    for model_chunk in models:
+        # unwrap DDP / Float16Module to get the raw nn.Module
+        inner = model_chunk
+        while hasattr(inner, 'module'):
+            inner = inner.module
+        for buf_name, buf in list(inner.named_buffers()):
+            if buf.device.type != 'cpu' and buf.storage().size() > 0:
+                buf.data = buf.data.to('cpu', non_blocking=True)
+        # clear lazy-created caches on RotaryEmbedding, attention mask, etc.
+        for mod in inner.modules():
+            for attr in ('cos_cached', 'sin_cached', '_cos_cached', '_sin_cached',
+                            'cos_', 'sin_', 'rotary_emb_cos', 'rotary_emb_sin',
+                            'causal_mask', '_causal_mask'):
+                t = getattr(mod, attr, None)
+                if isinstance(t, torch.Tensor) and t.device.type != 'cpu':
+                    setattr(mod, attr, t.to('cpu', non_blocking=True))
+    _gc.collect()
+
+
 @torch.no_grad()
 def offload_megatron_model_to_cpu(models):
     """
@@ -453,6 +476,8 @@ def offload_megatron_model_to_cpu(models):
                 param.data = param.data.to("cpu", non_blocking=True)
                 if param.grad is not None:
                     param.grad = param.grad.to("cpu", non_blocking=True)
+    
+    # _offload_model_remaining_buffers(models)
     gc.collect()
     get_torch_device().empty_cache()
 
@@ -535,6 +560,7 @@ def offload_megatron_copy_params(optimizers):
                 if isinstance(param_group, list):
                     for param in param_group:
                         offload_tensor_to_cpu(param)
+                        param.grad = None
                 else:
                     offload_tensor_to_cpu(param_group)
         else:
@@ -614,9 +640,9 @@ def offload_megatron_optimizer(optimizers):
                 opt_state_dict_values = _opt.optimizer.state.values()
                 for v in opt_state_dict_values:
                     if "exp_avg" in v:
-                        v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
+                        v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=False)
                     if "exp_avg_sq" in v:
-                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=True)
+                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=False)
 
         try:
             # Free TransformerEngine's dummy weight gradients cache
