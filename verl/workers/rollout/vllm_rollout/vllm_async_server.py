@@ -605,6 +605,36 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def update_draft_weights_from_ipc(self, use_shm: bool = False) -> bool:
+        """Receive Eagle3 draft model weights over IPC/ZMQ and load into the speculative engine.
+
+        This is the server-side counterpart to ``ServerAdapter.update_draft_weights``.
+        It uses the same ZMQ socket as policy weight updates but targets the speculative
+        draft engine inside vLLM.
+
+        Requires vLLM to be configured with Eagle3 speculative decoding
+        (speculative_config.method = "eagle3") and the underlying vLLM engine
+        to expose a ``draft_worker`` or equivalent attribute.
+
+        Returns:
+            True if weights were successfully loaded; False if speculative decoding
+            is not configured or the draft engine is not accessible.
+        """
+        try:
+            # vLLM exposes the speculative draft worker via collective_rpc on the engine
+            # The actual implementation delegates to each vLLM worker process
+            await self.engine.collective_rpc(
+                "update_draft_weights_from_ipc",
+                kwargs={"use_shm": use_shm},
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"update_draft_weights_from_ipc: failed to update speculative draft "
+                f"weights (is Eagle3 speculative decoding enabled in vLLM?): {e}"
+            )
+            return False
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             await self.engine.reset_prefix_cache()

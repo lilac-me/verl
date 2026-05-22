@@ -53,6 +53,7 @@ from verl.workers.config import (
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import ppo_loss
+from verl.workers.eagle import EagleDraftConfig, EagleDraftManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -146,6 +147,49 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self._eagle_manager: Optional[EagleDraftManager] = None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_eagle_draft(self, eagle_config: EagleDraftConfig) -> None:
+        """Initialize the Eagle3 draft model and wrap the loss function.
+
+        Must be called after the engine and model have been initialized (i.e.
+        after ``reset()``).  Replaces ``self.loss_fn`` with an ``EagleLossWrapper``
+        that appends the draft distillation term to the policy gradient loss.
+
+        The draft model is placed on the same GPU as the policy model.
+        """
+        if self._eagle_manager is not None:
+            logger.warning("Eagle draft manager already initialized; skipping re-init.")
+            return
+
+        if not eagle_config.enabled:
+            return
+
+        device_id = self.engine.get_device_id() if hasattr(self.engine, "get_device_id") else 0
+        torch_dtype = torch.bfloat16
+
+        policy_model = self.engine.module
+        self._eagle_manager = EagleDraftManager.build(
+            policy_model=policy_model,
+            eagle_config=eagle_config,
+            torch_dtype=torch_dtype,
+            device_id=device_id,
+        )
+
+        if self.loss_fn is not None:
+            self.loss_fn = self._eagle_manager.make_loss_wrapper(self.loss_fn)
+        logger.info("Eagle3 draft model initialized and loss wrapper installed.")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_eagle_draft_state_dict(self) -> Optional[dict]:
+        """Return Eagle3 draft model weights for syncing to the vLLM rollout engine.
+
+        Returns None if Eagle training is not enabled.
+        """
+        if self._eagle_manager is None:
+            return None
+        return self._eagle_manager.state_dict_for_vllm()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -351,6 +395,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
+
+        # Step the Eagle3 draft optimizer (separate from policy FSDP optimizer)
+        if self._eagle_manager is not None:
+            self._eagle_manager.optimizer_step()
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -578,6 +626,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
+
+            # Eagle3 online draft training
+            eagle_draft_config = model_config.get("eagle_draft", None)
+            if eagle_draft_config is not None:
+                from verl.workers.eagle import EagleDraftConfig
+                if isinstance(eagle_draft_config, dict):
+                    eagle_draft_config = EagleDraftConfig(**eagle_draft_config)
+                if getattr(eagle_draft_config, "enabled", False):
+                    self.actor.init_eagle_draft(eagle_draft_config)
 
         # 3. build rollout engine
         if "rollout" in self.role:

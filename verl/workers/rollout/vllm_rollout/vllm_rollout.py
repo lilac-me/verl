@@ -194,6 +194,53 @@ class ServerAdapter(BaseRollout):
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
 
+    @torch.no_grad()
+    async def update_draft_weights(
+        self,
+        draft_weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int = None,
+    ):
+        """Sync Eagle3 draft model weights to the vLLM speculative engine.
+
+        Called after each training step when Eagle online draft training is enabled.
+        Sends the draft model's current parameters to the vLLM rollout workers via
+        the same ZMQ/IPC mechanism used for policy weights.
+
+        The vLLM server must support the ``update_draft_weights_from_ipc`` collective
+        RPC method (a verl extension to the vLLM engine).
+
+        Args:
+            draft_weights: Generator of (name, tensor) pairs from the draft model's
+                           state dict.  Use ``EagleDraftManager.state_dict_for_vllm()``
+                           to produce these.
+            global_steps:  Optional global training step for logging.
+        """
+        if self.rollout_rank != 0:
+            # Non-rank-0 workers skip sending; vLLM broadcasts internally
+            return
+
+        start_time = time.time()
+
+        future = await self._execute_method(
+            "update_draft_weights_from_ipc",
+            non_block=True,
+            kwargs={"use_shm": self.use_shm},
+        )
+
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        await sender.async_send_weights(draft_weights)
+
+        if future is not None:
+            await future
+
+        if self.replica_rank == 0:
+            logger.info(f"update_draft_weights done, time cost: {time.time() - start_time:.2f}s")
+
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""
         return f"{self.config.get('name', 'vllm')}_"

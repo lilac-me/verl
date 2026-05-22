@@ -23,7 +23,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
+__all__ = ["HFModelConfig", "MtpConfig", "EagleDraftConfig"]
 
 
 @dataclass
@@ -65,6 +65,37 @@ class MtpConfig(BaseConfig):
 
     method: str = "mtp"
     num_speculative_tokens: int = 1
+
+
+@dataclass
+class EagleDraftConfig(BaseConfig):
+    """Configuration for Eagle3 online draft model training.
+
+    Enables joint training of an Eagle3 draft model alongside the RL policy so
+    the speculative decoding drafter stays synchronized during RL training.
+
+    Requires:
+      - vLLM rollout configured with speculative decoding (method = "eagle3")
+      - Pipeline parallelism NOT supported (pp_size must be 1)
+
+    Example YAML::
+
+        actor_rollout_ref:
+          model:
+            eagle_draft:
+              enabled: true
+              model_path: "AngelSlim/Qwen3-1.7B_eagle3"
+              loss_weight: 0.1
+    """
+
+    enabled: bool = False
+    # HuggingFace repo or local path to the Eagle3 draft checkpoint.
+    model_path: Optional[str] = None
+    # Relative weight of draft distillation loss: L_total = L_policy + loss_weight * L_draft
+    loss_weight: float = 0.1
+    # Indices of decoder layers whose hidden states are captured for the draft model.
+    # None → auto-select based on Eagle3 defaults (layer 1, mid-1, last-4).
+    aux_layer_indices: Optional[Any] = None  # list[int] | None
 
 
 @dataclass
@@ -144,6 +175,10 @@ class HFModelConfig(BaseConfig):
     architectures: Optional[list[str]] = None
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    # Eagle3 online draft training (speculative decoding drafter synchronized with RL policy).
+    # Requires vLLM rollout with speculative_config.method = "eagle3".
+    eagle_draft: "EagleDraftConfig" = field(default_factory=lambda: EagleDraftConfig())
 
     def __post_init__(self):
         import_external_libs(self.external_lib)

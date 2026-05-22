@@ -1,0 +1,114 @@
+# Eagle3 Online Draft Training + GRPO
+#
+# This config trains a Qwen3-1.7B policy with GRPO while simultaneously training
+# an Eagle3 draft model for speculative decoding.  After each training step the
+# draft model weights are synced to vLLM so speculative decoding uses the latest
+# draft parameters throughout the RL run.
+#
+# Requirements:
+#   1. Qwen3-1.7B base model: "Qwen/Qwen3-1.7B"
+#   2. Eagle3 draft checkpoint: "AngelSlim/Qwen3-1.7B_eagle3"
+#   3. vLLM >= 0.8.0 with Eagle3 speculative decoding support
+#   4. Pipeline parallelism must be disabled (pp_size=1)
+#
+# Usage:
+#   torchrun --nproc-per-node=8 -m verl.trainer.main_ppo_sync \
+#       --config-path examples/eagle_grpo \
+#       --config-name grpo_eagle3_qwen3_1.7b
+#
+
+defaults:
+  - ppo_trainer          # base config from verl/trainer/config/ppo_trainer.yaml
+  - _self_
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-1.7B
+    use_remove_padding: true
+
+    # Eagle3 online draft training
+    eagle_draft:
+      enabled: true
+      model_path: AngelSlim/Qwen3-1.7B_eagle3
+      loss_weight: 0.1                # λ: L_total = L_policy + 0.1 × L_draft
+      aux_layer_indices: null         # auto-select Eagle3 defaults (layer 1, mid-1, last-4)
+      optimizer:
+        lr: 1.0e-4
+        weight_decay: 0.0
+
+  # ── Actor training ──────────────────────────────────────────────────────────
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 4
+    use_dynamic_bsz: false
+
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.01
+      strategy: adamw
+      warmup_ratio: 0.05
+
+    policy_loss:
+      loss_mode: clip             # PPO clipped objective
+      clip_range: 0.2
+
+  # ── vLLM Rollout ────────────────────────────────────────────────────────────
+  rollout:
+    name: vllm
+    mode: async
+    gpu_memory_utilization: 0.7
+    tensor_model_parallel_size: 1
+    data_parallel_size: 1
+
+    # Eagle3 speculative decoding during rollout
+    # vLLM will use the draft model to propose tokens; the policy verifies them
+    vllm_kwargs:
+      speculative_config:
+        method: eagle3
+        model: AngelSlim/Qwen3-1.7B_eagle3
+        num_speculative_tokens: 3
+        draft_tensor_parallel_size: 1
+
+  # ── Reference policy ────────────────────────────────────────────────────────
+  ref:
+    strategy: fsdp
+    log_prob_micro_batch_size_per_gpu: 4
+    fsdp_config:
+      param_offload: false
+
+# ── Algorithm ─────────────────────────────────────────────────────────────────
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  tokenizer_path: Qwen/Qwen3-1.7B
+  train_files: data/math_train.parquet
+  val_files: data/math_val.parquet
+  prompt_key: prompt
+  max_prompt_length: 1024
+  max_response_length: 2048
+  train_batch_size: 256
+  val_batch_size: 256
+  n_samples_per_prompt: 8         # number of responses per prompt for GRPO
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_model:
+  enable: false
+
+custom_reward_function:
+  path: null
+
+# ── Trainer ───────────────────────────────────────────────────────────────────
+trainer:
+  total_epochs: 10
+  save_freq: 100
+  test_freq: 50
+  project_name: eagle_grpo
+  experiment_name: qwen3_1.7b_eagle3_math
+  logger: wandb
