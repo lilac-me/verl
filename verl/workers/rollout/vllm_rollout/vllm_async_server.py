@@ -606,23 +606,18 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def update_draft_weights_from_ipc(self, use_shm: bool = False) -> bool:
-        """Receive Eagle3 draft model weights over IPC/ZMQ and load into the speculative engine.
+        """Receive Eagle3 draft model weights and load into the speculative proposer.
 
-        This is the server-side counterpart to ``ServerAdapter.update_draft_weights``.
-        It uses the same ZMQ socket as policy weight updates but targets the speculative
-        draft engine inside vLLM.
+        Server-side counterpart to ``ServerAdapter.update_draft_weights``.
+        Dispatches ``update_draft_weights_from_ipc`` to each vLLM worker process via
+        ``collective_rpc``; the worker-side implementation in
+        ``vLLMColocateWorkerExtension`` receives the weights over a dedicated ZMQ socket
+        (``zmq_handle_draft``) and loads them into the Eagle3 proposer model.
 
-        Requires vLLM to be configured with Eagle3 speculative decoding
-        (speculative_config.method = "eagle3") and the underlying vLLM engine
-        to expose a ``draft_worker`` or equivalent attribute.
-
-        Returns:
-            True if weights were successfully loaded; False if speculative decoding
-            is not configured or the draft engine is not accessible.
+        Returns True if weights were loaded; False if the collective RPC failed (e.g.
+        speculative decoding is not configured).
         """
         try:
-            # vLLM exposes the speculative draft worker via collective_rpc on the engine
-            # The actual implementation delegates to each vLLM worker process
             await self.engine.collective_rpc(
                 "update_draft_weights_from_ipc",
                 kwargs={"use_shm": use_shm},
@@ -630,8 +625,8 @@ class vLLMHttpServer:
             return True
         except Exception as e:
             logger.warning(
-                f"update_draft_weights_from_ipc: failed to update speculative draft "
-                f"weights (is Eagle3 speculative decoding enabled in vLLM?): {e}"
+                f"update_draft_weights_from_ipc: collective_rpc failed — "
+                f"is speculative_config.method='eagle3' set in vLLM? error={e}"
             )
             return False
 

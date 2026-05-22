@@ -106,6 +106,11 @@ class ServerAdapter(BaseRollout):
         local_rank = self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        # Separate socket path for Eagle3 draft model weights to avoid any
+        # interleaving with policy weight transfers on the same socket.
+        self.zmq_handle_draft = (
+            f"ipc:///tmp/rl-colocate-zmq-draft-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        )
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
@@ -229,7 +234,7 @@ class ServerAdapter(BaseRollout):
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(
-            zmq_handle=self.zmq_handle,
+            zmq_handle=self.zmq_handle_draft,  # dedicated socket; avoids collision with policy weights
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )

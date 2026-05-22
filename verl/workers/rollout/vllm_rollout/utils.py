@@ -260,6 +260,81 @@ class vLLMColocateWorkerExtension:
         job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{self.local_rank}.sock"
 
+    def _get_zmq_handle_draft(self) -> str:
+        """Separate ZMQ handle for Eagle3 draft model weight transfer.
+
+        Uses a distinct socket path so draft weight transfers never collide with
+        policy weight transfers even if they are issued back-to-back.
+        """
+        replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
+        job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
+        return f"ipc:///tmp/rl-colocate-zmq-draft-{job_id}-replica-{replica_rank}-rank-{self.local_rank}.sock"
+
+    def update_draft_weights_from_ipc(self, use_shm: bool = False) -> bool:
+        """Receive Eagle3 draft model weights over IPC and load into the speculative proposer.
+
+        Called via ``collective_rpc`` from the verl server after each training step when
+        Eagle3 online draft training is enabled.  Mirrors ``update_weights_from_ipc`` but
+        targets the draft (proposer) model inside vLLM's speculative decoding worker.
+
+        Worker-class compatibility:
+          * When speculative decoding is enabled, vLLM wraps the base worker with
+            ``SpecDecodeWorker``.  ``self.proposer_worker`` is Eagle3's model worker.
+          * If the path is not found (e.g., non-rank-0 worker or unsupported vLLM
+            version), weights are still received and discarded so the sender is
+            not left blocked.
+
+        Returns:
+            True if weights were loaded; False if the draft model runner was not found.
+        """
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+        # Try attribute paths in order of likelihood for vLLM 0.8.x with Eagle3.
+        # When spec decode is enabled, `self` is the SpecDecodeWorker (mixed with
+        # this extension class), so `proposer_worker` is available directly.
+        draft_model_runner = None
+        for attr_path in [
+            # vLLM 0.8.x SpecDecodeWorker: self IS the spec decode worker
+            ["proposer_worker", "model_runner"],
+            # Some vLLM versions use draft_worker
+            ["draft_worker", "model_runner"],
+            # Eagle-specific naming
+            ["eagle_worker", "model_runner"],
+            # Nested: scorer_worker holds a back-ref to the spec decode parent
+            ["_spec_decode_worker", "proposer_worker", "model_runner"],
+        ]:
+            obj = self
+            for attr in attr_path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None and hasattr(getattr(obj, "model", None), "load_weights"):
+                draft_model_runner = obj
+                break
+
+        assert self.device is not None
+        receiver = BucketedWeightReceiver(
+            zmq_handle=self._get_zmq_handle_draft(),
+            device=self.device,
+            use_shm=use_shm,
+        )
+
+        if draft_model_runner is not None:
+            receiver.receive_weights(
+                on_bucket_received=lambda weights: draft_model_runner.model.load_weights(weights)
+            )
+            logger.info("Eagle3 draft model weights updated via IPC.")
+            return True
+
+        # Receive-and-discard: unblocks the sender even if draft model cannot be located.
+        logger.warning(
+            "update_draft_weights_from_ipc: Eagle3 proposer model_runner not found "
+            "(is speculative_config.method='eagle3' set in vLLM?). "
+            "Weights received but NOT loaded — draft model is stale."
+        )
+        receiver.receive_weights(on_bucket_received=lambda _weights: None)
+        return False
+
 
 class SuppressSignalInThread:
     def __enter__(self):

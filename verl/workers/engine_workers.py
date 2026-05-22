@@ -781,7 +781,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
-        # 3. offload model to cpu
+        # 3a. Eagle3 draft weight sync: push latest draft model to vLLM speculative engine.
+        # Only the naive (colocated) mode needs this — async checkpoint-based deployment
+        # handles weight delivery separately.  Since the draft model is replicated (not
+        # FSDP-sharded), `rollout_rank != 0` inside ServerAdapter already gates sending
+        # so only one sender is active per vLLM replica.
+        eagle_manager = getattr(self.actor, "_eagle_manager", None)
+        if eagle_manager is not None:
+            draft_sd = eagle_manager.state_dict_for_vllm()
+            if draft_sd:
+                await self.rollout.update_draft_weights(
+                    iter(draft_sd.items()),
+                    global_steps=global_steps,
+                )
+                log_gpu_memory_usage("After update_draft_weights", logger=logger)
+
+        # 3b. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
