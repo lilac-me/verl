@@ -33,6 +33,32 @@ from verl.workers.eagle.losses import compute_eagle_draft_loss_with_alignment
 logger = logging.getLogger(__name__)
 
 
+def _unpack_packed_tensor(
+    packed: Optional[torch.Tensor],
+    seq_lens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Unpack a packed [1, total_nnz, *feat] tensor to [batch, max_seq, *feat] with zero-padding.
+
+    verl's remove_padding mode concatenates all sequences along the token dimension,
+    yielding shape [1, Σ seq_i, feat].  This restores the [batch, max_seq, feat] layout
+    expected by the Eagle3 draft model.
+    """
+    if packed is None:
+        return None
+    if not (packed.dim() >= 2 and packed.shape[0] == 1):
+        return packed  # already in batch-first padded format
+    batch = seq_lens.shape[0]
+    max_seq = int(seq_lens.max().item())
+    feat_shape = packed.shape[2:]
+    out = packed.new_zeros(batch, max_seq, *feat_shape)
+    offset = 0
+    for i, length in enumerate(seq_lens.tolist()):
+        length = int(length)
+        out[i, :length] = packed[0, offset : offset + length]
+        offset += length
+    return out
+
+
 class EagleDraftManager:
     """Owns the Eagle3 draft model, its optimizer, and the hidden-state capture hooks.
 
@@ -207,12 +233,29 @@ class EagleLossWrapper:
             return policy_loss, metrics
 
         # ------------------------------------------------------------------ #
-        # 3. Roll embeddings for Eagle3 time-step alignment                  #
+        # 3. Unpack packed (remove_padding) tensors if needed                #
         # ------------------------------------------------------------------ #
-        rolled_embeds = roll_inputs_embeds(captured.inputs_embeds)
+        # When use_remove_padding=True, verl concatenates all sequences into
+        # a single [1, total_nnz, feat] tensor.  The draft model expects the
+        # standard [batch, max_seq, feat] padded layout.
+        input_ids = data.get("input_ids", None)
+        if input_ids is not None and isinstance(input_ids, torch.Tensor) and input_ids.is_nested:
+            seq_lens = input_ids.offsets().diff()  # [batch] — token count per sequence
+            hidden_states = _unpack_packed_tensor(captured.hidden_states, seq_lens)
+            inputs_embeds = _unpack_packed_tensor(captured.inputs_embeds, seq_lens)
+            lm_head_logits = _unpack_packed_tensor(captured.lm_head_logits, seq_lens)
+        else:
+            hidden_states = captured.hidden_states
+            inputs_embeds = captured.inputs_embeds
+            lm_head_logits = captured.lm_head_logits
 
         # ------------------------------------------------------------------ #
-        # 4. Draft model forward pass                                         #
+        # 4. Roll embeddings for Eagle3 time-step alignment                  #
+        # ------------------------------------------------------------------ #
+        rolled_embeds = roll_inputs_embeds(inputs_embeds)
+
+        # ------------------------------------------------------------------ #
+        # 5. Draft model forward pass                                         #
         # ------------------------------------------------------------------ #
         # Build attention mask from the response mask if available
         response_mask = data.get("response_mask", None)
@@ -224,15 +267,15 @@ class EagleLossWrapper:
             response_mask_t = None
 
         draft_logits: torch.Tensor = self.manager.draft_model(
-            hidden_states=captured.hidden_states,
+            hidden_states=hidden_states,
             inputs_embeds=rolled_embeds,
             attention_mask=response_mask_t,
         )
 
         # ------------------------------------------------------------------ #
-        # 5. Draft distillation loss (with Eagle3 time-step alignment)        #
+        # 6. Draft distillation loss (with Eagle3 time-step alignment)        #
         # ------------------------------------------------------------------ #
-        teacher_logits = captured.lm_head_logits  # already detached + float32
+        teacher_logits = lm_head_logits  # already detached + float32
 
         if response_mask_t is None:
             # Fall back: treat all tokens as valid
@@ -248,7 +291,7 @@ class EagleLossWrapper:
         )
 
         # ------------------------------------------------------------------ #
-        # 6. Combine losses                                                   #
+        # 7. Combine losses                                                   #
         # ------------------------------------------------------------------ #
         total_loss = policy_loss + draft_loss
         metrics["actor/draft_loss"] = draft_loss.detach().item()

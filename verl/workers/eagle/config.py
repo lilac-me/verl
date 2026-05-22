@@ -17,18 +17,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from verl.base_config import BaseConfig
+
 
 @dataclass
-class EagleDraftOptimizerConfig:
+class EagleDraftOptimizerConfig(BaseConfig):
     """Optimizer settings for the Eagle draft model (separate from policy optimizer)."""
 
-    # If None, draft model shares the policy optimizer's lr/wd
     lr: Optional[float] = None
     weight_decay: Optional[float] = None
 
 
 @dataclass
-class EagleDraftConfig:
+class EagleDraftConfig(BaseConfig):
     """Configuration for Eagle3 online draft model training.
 
     Enables joint training of an Eagle3 draft model alongside the RL policy.
