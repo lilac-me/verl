@@ -151,7 +151,23 @@ class EagleDraftManager:
         return EagleLossWrapper(base_loss_fn=base_loss_fn, manager=self)
 
     def optimizer_step(self) -> None:
-        """Step and zero the draft model optimizer (called after engine.train_batch)."""
+        """Step and zero the draft model optimizer (called after engine.train_batch).
+
+        The draft model is not wrapped with FSDP/DDP, so its gradients are not
+        automatically synchronised across data-parallel ranks.  We do it
+        explicitly here with an all_reduce before the optimiser step so every
+        rank applies the full-dataset gradient signal rather than a per-rank
+        shard.  This mirrors what DDP's grad hook does for regular modules.
+        """
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            world_size = dist.get_world_size()
+            for p in self.draft_model.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad.div_(world_size)
+
         torch.nn.utils.clip_grad_norm_(
             [p for p in self.draft_model.parameters() if p.requires_grad],
             max_norm=1.0,
