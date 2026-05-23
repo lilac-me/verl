@@ -14,6 +14,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -190,9 +191,6 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
 # Eagle3 draft-model distillation loss
 # ---------------------------------------------------------------------------
 
-import torch.nn.functional as F
-
-
 def roll_for_eagle_alignment(
     draft_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -231,9 +229,9 @@ def eagle_draft_loss(
     Returns:
         Scaled scalar loss.
     """
-    d, t, m = roll_for_eagle_alignment(draft_logits, teacher_logits, response_mask)
-    teacher_probs = F.softmax(t, dim=-1)
-    student_log_probs = F.log_softmax(d, dim=-1)
+    draft_logits, teacher_logits, response_mask = roll_for_eagle_alignment(draft_logits, teacher_logits, response_mask)
+    teacher_probs = F.softmax(teacher_logits, dim=-1)
+    student_log_probs = F.log_softmax(draft_logits, dim=-1)
     per_token = -(teacher_probs * student_log_probs).sum(dim=-1)
-    num_valid = m.float().sum().clamp(min=1)
-    return loss_weight * (per_token * m.float()).sum() / num_valid
+    num_valid = response_mask.float().sum().clamp(min=1)
+    return loss_weight * (per_token * response_mask.float()).sum() / num_valid

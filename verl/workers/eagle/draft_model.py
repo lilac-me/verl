@@ -64,9 +64,9 @@ class EagleDraftModelWrapper(nn.Module):
     via ``AutoModel.from_pretrained``.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, draft_model: nn.Module):
         super().__init__()
-        self.model = model
+        self.draft_model = draft_model
 
     def forward(
         self,
@@ -74,7 +74,7 @@ class EagleDraftModelWrapper(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        outputs = self.model(
+        outputs = self.draft_model(
             hidden_states=hidden_states,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -157,7 +157,7 @@ class Eagle3DraftModel(nn.Module):
         Returns:
             [B, S, vocab_size] logits
         """
-        # Feature fusion: (N_aux+1)*H → H
+        # Feature fusion: (N_aux+1)*H → H]
         x = self.fc(torch.cat([hidden_states, inputs_embeds], dim=-1))
 
         # Shallow transformer (inputs_embeds path bypasses token embedding)
