@@ -54,11 +54,13 @@ from tensordict import TensorDict
 
 from verl.workers.eagle.config import EagleDraftConfig
 from verl.workers.eagle.draft_model import (
+    Eagle3DraftModel,
     EagleDraftModelWrapper,
+    build_eagle3_from_policy,
     get_draft_state_dict_for_vllm,
     load_eagle_draft_model,
 )
-from verl.workers.eagle.hidden_capture import HiddenStateCapture, roll_inputs_embeds
+from verl.workers.eagle.hidden_capture import HiddenStateCapture, get_eagle3_aux_layer_indices, roll_inputs_embeds
 from verl.workers.utils.losses import eagle_draft_loss
 
 logger = logging.getLogger(__name__)
@@ -178,22 +180,57 @@ class EagleDraftManager:
         eagle_config: EagleDraftConfig,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        hf_config=None,
     ) -> "EagleDraftManager":
-        """Factory: load draft model, register hooks, build optimizer."""
+        """Factory: load or build draft model, register hooks, build optimizer.
+
+        Path A (``eagle_config.model_path`` is set): loads a pretrained HF
+        Eagle3 checkpoint via ``load_eagle_draft_model``.
+
+        Path B (``eagle_config.model_path`` is None): assembles an Eagle3 draft
+        from the policy's own components via ``build_eagle3_from_policy``.
+        Requires ``hf_config`` to be provided.
+        """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
-
-        draft_model = load_eagle_draft_model(
-            model_path=eagle_config.model_path,
-            torch_dtype=torch_dtype,
-            device=device,
-        )
 
         aux_layer_indices = (
             tuple(eagle_config.aux_layer_indices)
             if eagle_config.aux_layer_indices is not None
             else None
         )
+
+        if eagle_config.model_path is not None:
+            # Path A: load pretrained HF Eagle3 checkpoint
+            draft_model = load_eagle_draft_model(
+                model_path=eagle_config.model_path,
+                torch_dtype=torch_dtype,
+                device=device,
+            )
+        else:
+            # Path B: build from policy components (nemo-rl style)
+            if hf_config is None:
+                raise ValueError(
+                    "Eagle3 Path B (build from policy) requires hf_config. "
+                    "Pass the HuggingFace model config to EagleDraftManager.build()."
+                )
+
+            # Determine n_aux from whichever aux_layer_indices we end up using.
+            # auto-select uses get_eagle3_aux_layer_indices → 3 layers by default.
+            if aux_layer_indices is not None:
+                n_aux = len(aux_layer_indices)
+            else:
+                n_aux = len(get_eagle3_aux_layer_indices(hf_config.num_hidden_layers))
+
+            draft_model = build_eagle3_from_policy(
+                policy_model=policy_model,
+                hf_config=hf_config,
+                n_aux=n_aux,
+                num_draft_layers=eagle_config.num_draft_layers,
+                torch_dtype=torch_dtype,
+                device=device,
+            )
+
         capture = HiddenStateCapture(
             model=policy_model,
             aux_layer_indices=aux_layer_indices,
@@ -244,6 +281,10 @@ class EagleDraftManager:
         )
         self.optimizer.step()
         self.optimizer.zero_grad()
+
+        # Path B: keep frozen lm_head aligned with the policy's updated lm_head.
+        if isinstance(self.draft_model, Eagle3DraftModel):
+            self.draft_model.sync_lm_head()
 
     def state_dict_for_vllm(self) -> Iterator[Tuple[str, torch.Tensor]]:
         """Yield (name, cpu_float32_tensor) pairs for loading into vLLM."""

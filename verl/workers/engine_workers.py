@@ -200,11 +200,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
             policy_model = policy_model[0]
 
         device = torch.device("cuda", torch.cuda.current_device())
+        hf_config = getattr(self.model_config, "hf_config", None)
         self._eagle_manager = EagleDraftManager.build(
             policy_model=policy_model,
             eagle_config=eagle_config,
             torch_dtype=torch.bfloat16,
             device=device,
+            hf_config=hf_config,
         )
 
         if self.loss_fn is not None:

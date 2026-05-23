@@ -59,7 +59,18 @@ class EagleDraftConfig(BaseConfig):
     """
 
     enabled: bool = False
+
+    # Path to a pretrained HuggingFace Eagle3 checkpoint.
+    # If None, the draft model is built from the policy's own components
+    # (feature-fusion fc + shallow copy of policy layers + frozen lm_head).
     model_path: Optional[str] = None
+
+    # ---- "build from policy" options (only used when model_path is None) ----
+    # Number of transformer decoder layers in the built draft model.
+    num_draft_layers: int = 1
+
+    # Scaling factor λ: total_loss = policy_loss + λ * draft_loss
     loss_weight: float = 0.1
+    # null → auto Eagle3 heuristic (1, num_layers//2-1, num_layers-4)
     aux_layer_indices: Optional[List[int]] = None
     optimizer: EagleDraftOptimizerConfig = field(default_factory=EagleDraftOptimizerConfig)
