@@ -184,3 +184,56 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     )
 
     return vf_loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# Eagle3 draft-model distillation loss
+# ---------------------------------------------------------------------------
+
+import torch.nn.functional as F
+
+
+def roll_for_eagle_alignment(
+    draft_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple:
+    """Left-shift logits and mask by one for Eagle3 time-step alignment.
+
+    The draft model at position t predicts the policy distribution at t+1.
+    Rolling left aligns draft and teacher at the same token target.  The last
+    position receives mask=0 to exclude the roll wrap-around artifact.
+    """
+    draft_logits = torch.roll(draft_logits, shifts=-1, dims=1)
+    teacher_logits = torch.roll(teacher_logits, shifts=-1, dims=1)
+    response_mask = torch.roll(response_mask, shifts=-1, dims=1).clone()
+    response_mask[:, -1] = 0
+    return draft_logits, teacher_logits, response_mask
+
+
+def eagle_draft_loss(
+    draft_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_weight: float = 0.1,
+) -> torch.Tensor:
+    """Forward-KL distillation loss for the Eagle3 draft model.
+
+    Applies Eagle3 time-step alignment roll, then computes soft cross-entropy
+    between the draft distribution and the (detached) policy distribution.
+
+    Args:
+        draft_logits:   [batch, seq, vocab] — draft model output (float32)
+        teacher_logits: [batch, seq, vocab] — policy LM-head logits, detached
+        response_mask:  [batch, seq]        — 1 for response tokens
+        loss_weight:    λ; returned loss = λ × L_draft
+
+    Returns:
+        Scaled scalar loss.
+    """
+    d, t, m = roll_for_eagle_alignment(draft_logits, teacher_logits, response_mask)
+    teacher_probs = F.softmax(t, dim=-1)
+    student_log_probs = F.log_softmax(d, dim=-1)
+    per_token = -(teacher_probs * student_log_probs).sum(dim=-1)
+    num_valid = m.float().sum().clamp(min=1)
+    return loss_weight * (per_token * m.float()).sum() / num_valid

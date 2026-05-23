@@ -59,7 +59,7 @@ from verl.workers.eagle.draft_model import (
     load_eagle_draft_model,
 )
 from verl.workers.eagle.hidden_capture import HiddenStateCapture, roll_inputs_embeds
-from verl.workers.eagle.losses import compute_eagle_draft_loss_with_alignment
+from verl.workers.utils.losses import eagle_draft_loss
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +355,7 @@ class EagleLossWrapper:
         )
 
         # 6. Distillation loss (with Eagle3 alignment roll) ----------------------
-        draft_loss = compute_eagle_draft_loss_with_alignment(
+        draft_loss = eagle_draft_loss(
             draft_logits=draft_logits.float(),
             teacher_logits=lm_head_logits,          # already detached + float32
             response_mask=response_mask_t,
