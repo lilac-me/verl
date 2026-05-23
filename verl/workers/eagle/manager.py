@@ -39,7 +39,7 @@ def _unpack_packed_tensor(
 ) -> Optional[torch.Tensor]:
     """Unpack a packed [1, total_nnz, *feat] tensor to [batch, max_seq, *feat] with zero-padding.
 
-    verl's remove_padding mode concatenates all sequences along the token dimension,
+    verl's FSDP remove_padding mode concatenates all sequences along the token dimension,
     yielding shape [1, Σ seq_i, feat].  This restores the [batch, max_seq, feat] layout
     expected by the Eagle3 draft model.
     """
@@ -56,6 +56,56 @@ def _unpack_packed_tensor(
         length = int(length)
         out[i, :length] = packed[0, offset : offset + length]
         offset += length
+    return out
+
+
+def _unpack_megatron_thd_tensor(
+    packed: Optional[torch.Tensor],
+    seq_lens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Unpack a Megatron thd-format tensor to [batch, max_seq, *feat].
+
+    In Megatron's remove_padding (thd) mode, decoder-layer activations have shape
+    [total_tokens_padded, *feat] (2-D or more).  Each sequence is padded to a
+    multiple of (TP * CP * 2) tokens before being concatenated.  We recompute the
+    per-sequence padded length to extract valid tokens and place them into the
+    output buffer.
+
+    Args:
+        packed:   Tensor of shape [total_tokens_padded, *feat] from a hook.
+        seq_lens: 1-D int tensor of valid token counts per sequence.
+    """
+    if packed is None:
+        return None
+    if packed.dim() < 2 or (packed.dim() >= 2 and packed.shape[0] == 1):
+        # Fall back to FSDP-style unpack for 3-D [1, total, feat] tensors.
+        return _unpack_packed_tensor(packed, seq_lens)
+
+    # Compute per-sequence alignment padding (mirrors preprocess_thd_engine logic)
+    try:
+        from megatron.core import parallel_state as mpu
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
+    except ImportError:
+        tp_size, cp_size = 1, 1
+
+    align = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    align = max(align, 1)
+
+    batch = seq_lens.shape[0]
+    max_seq = int(seq_lens.max().item())
+    feat_shape = packed.shape[1:]
+    out = packed.new_zeros(batch, max_seq, *feat_shape)
+
+    offset = 0
+    for i, length in enumerate(seq_lens.tolist()):
+        length = int(length)
+        # Each sequence is padded to the next multiple of `align`
+        pad = (align - length % align) % align
+        padded_len = length + pad
+        out[i, :length] = packed[offset : offset + length]
+        offset += padded_len
+
     return out
 
 
@@ -251,15 +301,29 @@ class EagleLossWrapper:
         # ------------------------------------------------------------------ #
         # 3. Unpack packed (remove_padding) tensors if needed                #
         # ------------------------------------------------------------------ #
-        # When use_remove_padding=True, verl concatenates all sequences into
-        # a single [1, total_nnz, feat] tensor.  The draft model expects the
-        # standard [batch, max_seq, feat] padded layout.
+        # Two packed layouts are possible depending on the training backend:
+        #
+        # FSDP remove_padding:    [1, total_nnz, feat]  — 3-D, batch-dim=1
+        # Megatron thd format:    [total_tokens, feat]  — 2-D, no batch dim
+        #
+        # Both are detected by checking whether data["input_ids"] is a nested
+        # tensor (carrying per-sequence lengths via .offsets()).
         input_ids = data.get("input_ids", None)
         if input_ids is not None and isinstance(input_ids, torch.Tensor) and input_ids.is_nested:
-            seq_lens = input_ids.offsets().diff()  # [batch] — token count per sequence
-            hidden_states = _unpack_packed_tensor(captured.hidden_states, seq_lens)
-            inputs_embeds = _unpack_packed_tensor(captured.inputs_embeds, seq_lens)
-            lm_head_logits = _unpack_packed_tensor(captured.lm_head_logits, seq_lens)
+            seq_lens = input_ids.offsets().diff()  # [batch] — valid tokens per sequence
+
+            # Choose the right unpacker based on captured tensor dimensionality.
+            # 2-D → Megatron thd (needs alignment-aware offsets).
+            # 3-D [1, total, feat] → FSDP style.
+            hs = captured.hidden_states
+            if hs is not None and hs.dim() == 2:
+                _unpack = _unpack_megatron_thd_tensor
+            else:
+                _unpack = _unpack_packed_tensor
+
+            hidden_states = _unpack(captured.hidden_states, seq_lens)
+            inputs_embeds = _unpack(captured.inputs_embeds, seq_lens)
+            lm_head_logits = _unpack(captured.lm_head_logits, seq_lens)
         else:
             hidden_states = captured.hidden_states
             inputs_embeds = captured.inputs_embeds

@@ -14,7 +14,7 @@
 
 """Captures intermediate hidden states from the policy model for Eagle draft training.
 
-Registers temporary forward hooks on selected decoder layers and the embedding
+Registers persistent forward hooks on selected decoder layers and the embedding
 layer.  After the policy forward pass, ``get_captured_states()`` assembles the
 captured tensors into the format expected by the Eagle draft model:
 
@@ -24,8 +24,12 @@ captured tensors into the format expected by the Eagle draft model:
 The caller must call ``roll_inputs_embeds`` on the returned embeds to apply the
 time-step shift required by Eagle3 before passing to the draft model.
 
-Supports FSDP and DDP (single-node and multi-node DP).  Pipeline parallelism is
-NOT supported — see note in EagleDraftConfig.
+Supported backends:
+* FSDP / DDP (HuggingFace-style models): full support
+* Megatron-Core (mcore) models, PP=1: full support (bshd or thd format)
+* Megatron-Core, PP>1: NOT supported — each pipeline stage only holds a subset
+  of layers, so hidden states cannot be collected on a single rank without
+  explicit inter-stage communication.
 """
 
 from __future__ import annotations
@@ -118,7 +122,18 @@ class HiddenStateCapture:
 
     @staticmethod
     def _unwrap(model: nn.Module) -> nn.Module:
-        """Strip FSDP / DDP / compiled wrappers to reach the inner module."""
+        """Strip FSDP / DDP / Megatron-list / compiled wrappers to reach the inner module.
+
+        Megatron passes ``self.engine.module`` which is a ``list[GPTModel]`` — one
+        element per virtual-pipeline stage.  For PP=1 the list has exactly one
+        element; callers must guard against PP>1 before reaching this point.
+        """
+        # Megatron: engine.module is a list of model chunks (VPP/PP stages)
+        if isinstance(model, list):
+            if not model:
+                raise ValueError("Empty model list passed to HiddenStateCapture")
+            model = model[0]
+
         from torch.nn.parallel import DistributedDataParallel
 
         try:
@@ -140,22 +155,40 @@ class HiddenStateCapture:
 
     @staticmethod
     def _find_layers(inner: nn.Module) -> nn.ModuleList:
-        """Return the transformer decoder layer list."""
+        """Return the transformer decoder layer list.
+
+        Tries both HuggingFace convention (``model.model.layers`` / ``model.layers``)
+        and Megatron-Core convention (``model.decoder.layers`` where ``decoder`` is
+        a ``TransformerBlock`` containing a ``ModuleList`` of layers).
+        """
+        # HF-style: model.model.layers or model.layers
         for attr in ("model", ""):
             obj = getattr(inner, attr, inner) if attr else inner
-            for layers_attr in ("layers", "decoder", "h", "blocks"):
+            for layers_attr in ("layers", "h", "blocks"):
                 candidate = getattr(obj, layers_attr, None)
                 if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
                     return candidate
+
+        # Mcore-style: model.decoder is a TransformerBlock; layers live inside it
+        decoder_block = getattr(inner, "decoder", None)
+        if decoder_block is not None:
+            candidate = getattr(decoder_block, "layers", None)
+            if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
+                return candidate
+
         raise AttributeError(
             "Cannot locate decoder layers in model. "
-            "Expected model.model.layers or model.layers (HF convention)."
+            "Expected model.model.layers (HF) or model.decoder.layers (Mcore)."
         )
 
     @staticmethod
     def _find_lm_head(inner: nn.Module) -> Optional[nn.Module]:
-        """Return the LM head module (linear projection to vocab), or None if not found."""
-        for attr in ("lm_head", "embed_out", "output", "head"):
+        """Return the LM head module (linear projection to vocab), or None.
+
+        Checks both HF convention (``lm_head``) and Mcore convention
+        (``output_layer``).
+        """
+        for attr in ("lm_head", "output_layer", "embed_out", "output", "head"):
             candidate = getattr(inner, attr, None)
             if candidate is not None and isinstance(candidate, nn.Module):
                 return candidate
@@ -163,13 +196,18 @@ class HiddenStateCapture:
 
     @staticmethod
     def _find_embed(inner: nn.Module) -> nn.Module:
-        """Return the token embedding module."""
+        """Return the token embedding module.
+
+        Checks HF paths first, then Mcore path
+        (``model.embedding.word_embeddings``).
+        """
         for path in (
-            ("model", "embed_tokens"),
+            ("model", "embed_tokens"),   # LLaMA / Mistral / Qwen HF
             ("embed_tokens",),
-            ("model", "wte"),
+            ("model", "wte"),             # GPT-2 HF
             ("wte",),
             ("model", "embedding"),
+            ("embedding", "word_embeddings"),  # Mcore GPTModel
             ("embedding",),
         ):
             obj = inner
@@ -183,7 +221,8 @@ class HiddenStateCapture:
                 return obj
         raise AttributeError(
             "Cannot locate embedding layer in model. "
-            "Expected model.model.embed_tokens (HF convention)."
+            "Expected model.model.embed_tokens (HF) or "
+            "model.embedding.word_embeddings (Mcore)."
         )
 
     # ------------------------------------------------------------------
@@ -192,19 +231,27 @@ class HiddenStateCapture:
 
     def _make_layer_hook(self, layer_idx: int):
         def hook(_module, _args, output):
-            # HF decoder layers return a tuple; first element is hidden states
+            # HF layers return (hidden, ...) tuple; Mcore layers return hidden directly.
             hidden = output[0] if isinstance(output, tuple) else output
-            if hidden is not None:
-                # Store as [batch, seq, hidden] — HF convention
-                self._captured[f"layer_{layer_idx}"] = hidden.detach()
+            if hidden is None or not isinstance(hidden, torch.Tensor):
+                return
+            if not hidden.is_floating_point():
+                return
+            # Accept both [batch, seq, hidden] (bshd) and [total_tokens, hidden] (thd).
+            if hidden.dim() not in (2, 3):
+                return
+            self._captured[f"layer_{layer_idx}"] = hidden.detach()
 
         return hook
 
     def _make_embed_hook(self):
         def hook(_module, _args, output):
             embeds = output[0] if isinstance(output, tuple) else output
-            if embeds is not None:
-                self._captured["embeds"] = embeds.detach()
+            if embeds is None or not isinstance(embeds, torch.Tensor):
+                return
+            if not embeds.is_floating_point():
+                return
+            self._captured["embeds"] = embeds.detach()
 
         return hook
 

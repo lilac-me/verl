@@ -170,6 +170,35 @@ class TrainingWorker(Worker, DistProfilerExtension):
         torch_dtype = torch.bfloat16
 
         policy_model = self.engine.module
+
+        # Megatron backend: engine.module is a list of model chunks (one per VPP stage).
+        # Eagle3 hook-based capture requires all layers (embedding, aux layers, LM head)
+        # to be on the same rank, which is only guaranteed when PP=1.
+        if isinstance(policy_model, list):
+            try:
+                from megatron.core import parallel_state as mpu
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
+            except ImportError:
+                pp_size = 1
+
+            if pp_size > 1:
+                logger.warning(
+                    "Eagle3 online draft training is not supported with pipeline parallelism "
+                    f"(PP={pp_size} > 1). Skipping Eagle draft initialization."
+                )
+                return
+
+            vpp_size = len(policy_model)
+            if vpp_size > 1:
+                logger.warning(
+                    "Eagle3 online draft training is not supported with virtual pipeline "
+                    f"parallelism (VPP={vpp_size} > 1). Skipping Eagle draft initialization."
+                )
+                return
+
+            # PP=1, VPP=1: single model chunk — unwrap the list
+            policy_model = policy_model[0]
+
         self._eagle_manager = EagleDraftManager.build(
             policy_model=policy_model,
             eagle_config=eagle_config,
