@@ -234,7 +234,6 @@ class EagleDraftManager:
         capture = HiddenStateCapture(
             model=policy_model,
             aux_layer_indices=aux_layer_indices,
-            capture_logits=True,
         )
 
         optimizer = cls._build_optimizer(draft_model, eagle_config)
@@ -292,7 +291,7 @@ class EagleDraftManager:
 
     def save_pretrained(self, path: str) -> None:
         """Save the draft model in HuggingFace format for checkpointing."""
-        inner = self.draft_model.model
+        inner = self.draft_model.draft_model
         if hasattr(inner, "save_pretrained"):
             inner.save_pretrained(path)
         else:
@@ -314,7 +313,7 @@ class EagleLossWrapper:
 
     Steps:
     1. Compute the base policy loss via ``base_loss_fn``.
-    2. Read hidden states / embeddings / LM-head logits captured by the hooks.
+    2. Read hidden states / embeddings captured by the hooks; take teacher logits from ``model_output``.
     3. Unpack packed tensors (remove_padding mode) to [batch, max_seq, feat].
     4. Run the Eagle3 draft model forward.
     5. Compute distillation loss (soft cross-entropy with Eagle3 alignment).
@@ -342,13 +341,16 @@ class EagleLossWrapper:
         # Clear immediately so stale state never leaks to the next micro-batch
         self.manager.capture._captured.clear()
 
-        if (
-            captured.hidden_states is None
-            or captured.inputs_embeds is None
-            or captured.lm_head_logits is None
-        ):
+        if captured.hidden_states is None or captured.inputs_embeds is None:
             logger.debug("Eagle3: missing captured states; skipping draft loss this step.")
             return policy_loss, metrics
+
+        # Teacher logits come directly from model_output (already computed by policy forward)
+        teacher_logits = model_output.get("logits", None)
+        if teacher_logits is None:
+            logger.debug("Eagle3: logits not found in model_output; skipping draft loss.")
+            return policy_loss, metrics
+        teacher_logits = teacher_logits.detach().float()
 
         # 3. Unpack packed tensors -----------------------------------------------
         # Both FSDP and Megatron remove_padding modes mark input_ids as a nested
@@ -367,12 +369,11 @@ class EagleLossWrapper:
 
             hidden_states = _unpack(captured.hidden_states, seq_lens)
             inputs_embeds = _unpack(captured.inputs_embeds, seq_lens)
-            lm_head_logits = _unpack(captured.lm_head_logits, seq_lens)
+            teacher_logits = _unpack(teacher_logits, seq_lens)
         else:
             # No packing: tensors are already [batch, seq, feat]
             hidden_states = captured.hidden_states
             inputs_embeds = captured.inputs_embeds
-            lm_head_logits = captured.lm_head_logits
 
         # 4. Eagle3 time-step alignment roll ------------------------------------
         rolled_embeds = roll_inputs_embeds(inputs_embeds)
@@ -398,7 +399,7 @@ class EagleLossWrapper:
         # 6. Distillation loss (with Eagle3 alignment roll) ----------------------
         draft_loss = eagle_draft_loss(
             draft_logits=draft_logits.float(),
-            teacher_logits=lm_head_logits,          # already detached + float32
+            teacher_logits=teacher_logits,
             response_mask=response_mask_t,
             loss_weight=self.manager.config.loss_weight,
         )

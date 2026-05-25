@@ -132,11 +132,11 @@ class Eagle3DraftModel(nn.Module):
             ``EagleDraftManager`` after construction.
     """
 
-    def __init__(self, fc: nn.Linear, base: nn.Module, lm_head: nn.Module):
+    def __init__(self, fc: nn.Linear, eagle_module: nn.Module, eagle_output_layer: nn.Module):
         super().__init__()
         self.fc = fc
-        self.base = base
-        self.lm_head = lm_head  # frozen; in state_dict, excluded from optimizer
+        self.eagle_module = eagle_module
+        self.eagle_output_layer = eagle_output_layer
 
         # Set by EagleDraftManager so we can sync after policy steps
         self._policy_lm_head_ref: Optional[nn.Module] = None
@@ -157,15 +157,17 @@ class Eagle3DraftModel(nn.Module):
         Returns:
             [B, S, vocab_size] logits
         """
-        # Feature fusion: (N_aux+1)*H → H]
+        # Feature fusion: (N_aux+1)*H → H
         x = self.fc(torch.cat([hidden_states, inputs_embeds], dim=-1))
 
-        # Shallow transformer (inputs_embeds path bypasses token embedding)
-        outputs = self.base(inputs_embeds=x, attention_mask=attention_mask)
+        # Shallow transformer — inputs_embeds path bypasses the token embedding table
+        outputs = self.eagle_module(inputs_embeds=x, attention_mask=attention_mask)
         x = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
 
-        # Vocab projection (frozen; gradients flow through via chain rule)
-        return self.lm_head(x)
+        # Vocab projection via frozen eagle_output_layer; gradients flow through via chain rule
+        logits =  self.eagle_output_layer(x)
+
+        return logits
 
     def sync_lm_head(self, policy_lm_head: Optional[nn.Module] = None) -> None:
         """Copy policy's updated LM-head weights into this frozen copy.
@@ -181,7 +183,7 @@ class Eagle3DraftModel(nn.Module):
         if src is None:
             return
         with torch.no_grad():
-            for dst_p, src_p in zip(self.lm_head.parameters(), src.parameters()):
+            for dst_p, src_p in zip(self.eagle_output_layer.parameters(), src.parameters()):
                 dst_p.copy_(src_p)
 
 
@@ -274,7 +276,7 @@ def build_eagle3_from_policy(
     for p in lm_head.parameters():
         p.requires_grad = False
 
-    model = Eagle3DraftModel(fc=fc, base=base, lm_head=lm_head)
+    model = Eagle3DraftModel(fc=fc, eagle_module=base, eagle_output_layer=lm_head)
 
     # Store a reference so sync_lm_head() can be called without arguments
     model._policy_lm_head_ref = policy_lm_head
@@ -299,7 +301,7 @@ def get_draft_state_dict_for_vllm(
     keys.
     """
     if isinstance(draft_model, EagleDraftModelWrapper):
-        src = draft_model.model
+        src = draft_model.draft_model
     else:
         src = draft_model
 

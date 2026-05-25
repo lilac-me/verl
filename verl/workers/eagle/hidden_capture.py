@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -73,8 +74,6 @@ class CapturedStates:
     hidden_states: Optional[torch.Tensor] = None
     # [batch, seq, hidden_size]
     inputs_embeds: Optional[torch.Tensor] = None
-    # [batch, seq, vocab_size]  — detached, float32
-    lm_head_logits: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +97,7 @@ def roll_inputs_embeds(embeds: torch.Tensor) -> torch.Tensor:
 class HiddenStateCapture:
     """Registers persistent forward hooks on the policy model to collect activations.
 
-    Supports both HuggingFace (FSDP) and Megatron-Core model layouts.  The
-    hooks fire on every policy forward pass; captured data is cleared by the
+    The hooks fire on every policy forward pass; captured data is cleared by the
     caller after each use to prevent stale state from leaking across steps.
 
     Args:
@@ -112,15 +110,13 @@ class HiddenStateCapture:
         self,
         model: nn.Module,
         aux_layer_indices: Optional[Tuple[int, ...]] = None,
-        capture_logits: bool = True,
     ):
-        self._inner = self._unwrap(model)
-        self._layers = self._find_layers(self._inner)
-        self._embed = self._find_embed(self._inner)
-        self._lm_head = self._find_lm_head(self._inner) if capture_logits else None
+        self._model = self._unwrap_model(model)
+        self._layers = self._find_layers(self._model)
+        self._embed = self._find_embed(self._model)
 
         num_layers = len(self._layers)
-        self._aux_indices: Tuple[int, ...] = (
+        self._aux_indices = (
             aux_layer_indices
             if aux_layer_indices is not None
             else get_eagle3_aux_layer_indices(num_layers)
@@ -134,51 +130,45 @@ class HiddenStateCapture:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _unwrap(model) -> nn.Module:
-        """Unwrap FSDP / DDP / Megatron-list / torch.compile wrappers."""
-        # Megatron: engine.module is a list[GPTModel] (one chunk per VPP stage)
-        if isinstance(model, list):
-            if not model:
-                raise ValueError("Empty model list passed to HiddenStateCapture")
-            model = model[0]
-
-        try:
+    def _unwrap_model(model, model_instances=None):
+        """Unwrap model to return the final model instance"""
+        if model_instances is None:
+            from megatron.core.distributed import DistributedDataParallel as DDP
+            from megatron.core.transformer.module import Float16Module
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            while isinstance(model, FSDP):
-                model = model.module
-        except ImportError:
-            pass
 
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        while isinstance(model, DDP):
-            model = model.module
-
-        if hasattr(model, "_orig_mod"):  # torch.compile
-            model = model._orig_mod
-
-        return model
+            module_instances = (DDP, FSDP, Float16Module)
+        
+        return_list = True
+        if not isinstance(model, list):
+            model = [model]
+            return_list = False
+        unwrapped_model = []
+        for model_module in model:
+            while isinstance(model_module, module_instances):
+                model_module = model_module.module
+            unwrapped_model.append(model_module)
+        if not return_list:
+            return unwrapped_model[0]
+        return unwrapped_model
 
     @staticmethod
     def _find_layers(inner: nn.Module) -> nn.ModuleList:
-        """Locate the decoder layer ModuleList.
-
-        Tries HF paths first (``model.model.layers``, ``model.layers``), then
-        Mcore path (``model.decoder.layers`` inside a TransformerBlock).
         """
-        # HF-style
-        for parent_attr in ("model", ""):
-            obj = getattr(inner, parent_attr, inner) if parent_attr else inner
-            for layers_attr in ("layers", "h", "blocks"):
-                candidate = getattr(obj, layers_attr, None)
-                if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
-                    return candidate
+        Locate the decoder layer ModuleList.
 
-        # Mcore-style: model.decoder is a TransformerBlock; layers live inside it
-        decoder_block = getattr(inner, "decoder", None)
-        if decoder_block is not None:
-            candidate = getattr(decoder_block, "layers", None)
-            if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
-                return candidate
+        HF path:   model.model.layers  (Qwen2/3, LLaMA, Mistral, …)
+        Mcore path: model.decoder.layers (GPTModel with TransformerBlock)
+        """
+        # HF: model.model.layers
+        candidate = getattr(getattr(inner, "model", None), "layers", None)
+        if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
+            return candidate
+
+        # Mcore: model.decoder.layers
+        candidate = getattr(getattr(inner, "decoder", None), "layers", None)
+        if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
+            return candidate
 
         raise AttributeError(
             "Cannot locate decoder layers. "
@@ -187,27 +177,21 @@ class HiddenStateCapture:
 
     @staticmethod
     def _find_embed(inner: nn.Module) -> nn.Module:
-        """Locate the token embedding module.
-
-        Tries HF paths first, then Mcore ``model.embedding.word_embeddings``.
         """
-        for path in (
-            ("model", "embed_tokens"),           # LLaMA / Mistral / Qwen HF
-            ("embed_tokens",),
-            ("model", "wte"),                     # GPT-2 HF
-            ("wte",),
-            ("embedding", "word_embeddings"),     # Mcore GPTModel
-            ("model", "embedding"),
-            ("embedding",),
-        ):
-            obj = inner
-            for part in path:
-                obj = getattr(obj, part, None)
-                if obj is None:
-                    break
-            else:
-                if obj is not None:
-                    return obj
+        Locate the token embedding module.
+
+        HF path:   model.model.embed_tokens  (Qwen2/3, LLaMA, Mistral, …)
+        Mcore path: model.embedding.word_embeddings (GPTModel)
+        """
+        # HF: model.model.embed_tokens
+        embed = getattr(getattr(inner, "model", None), "embed_tokens", None)
+        if embed is not None:
+            return embed
+
+        # Mcore: model.embedding.word_embeddings
+        embed = getattr(getattr(inner, "embedding", None), "word_embeddings", None)
+        if embed is not None:
+            return embed
 
         raise AttributeError(
             "Cannot locate embedding layer. "
@@ -215,48 +199,23 @@ class HiddenStateCapture:
             "model.embedding.word_embeddings (Mcore)."
         )
 
-    @staticmethod
-    def _find_lm_head(inner: nn.Module) -> Optional[nn.Module]:
-        """Locate the LM head (linear projection to vocab size).
-
-        Checks HF ``lm_head`` and Mcore ``output_layer``.
-        """
-        for attr in ("lm_head", "output_layer", "embed_out", "output", "head"):
-            candidate = getattr(inner, attr, None)
-            if candidate is not None and isinstance(candidate, nn.Module):
-                return candidate
-        return None
-
     # ------------------------------------------------------------------
     # Hook construction
     # ------------------------------------------------------------------
 
     def _make_layer_hook(self, layer_idx: int):
         def hook(_module, _args, output):
-            # HF layers return (hidden, ...); Mcore layers return hidden directly
-            hidden = output[0] if isinstance(output, tuple) else output
-            if not isinstance(hidden, torch.Tensor) or not hidden.is_floating_point():
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            if hidden_states is None:
                 return
             # Accept [batch, seq, hidden] (bshd) and [total_tokens, hidden] (thd)
-            if hidden.dim() in (2, 3):
-                self._captured[f"layer_{layer_idx}"] = hidden.detach()
+            if hidden_states.dim() in (2, 3):
+                self._captured[f"layer_{layer_idx}"] = hidden_states.detach().clone()
         return hook
 
     def _make_embed_hook(self):
         def hook(_module, _args, output):
-            embeds = output[0] if isinstance(output, tuple) else output
-            if not isinstance(embeds, torch.Tensor) or not embeds.is_floating_point():
-                return
-            self._captured["embeds"] = embeds.detach()
-        return hook
-
-    def _make_lm_head_hook(self):
-        def hook(_module, _args, output):
-            logits = output[0] if isinstance(output, tuple) else output
-            if not isinstance(logits, torch.Tensor) or not logits.is_floating_point():
-                return
-            # Keep in float32 for numerically stable soft cross-entropy
-            self._captured["lm_head_logits"] = logits.detach().float()
+            self._captured["embeds"] = output.detach().clone()
         return hook
 
     # ------------------------------------------------------------------
@@ -264,12 +223,14 @@ class HiddenStateCapture:
     # ------------------------------------------------------------------
 
     def register_hooks(self) -> None:
-        """Register persistent hooks on the policy model.
+        """
+        Register persistent hooks on the policy model.
 
         Called once during initialization; hooks remain active for the
         lifetime of the manager.
         """
-        self._hooks.clear()
+        self.clear_hooks()
+        self._captured.clear()
         self._hooks.append(self._embed.register_forward_hook(self._make_embed_hook()))
 
         for idx in self._aux_indices:
@@ -278,19 +239,24 @@ class HiddenStateCapture:
                     self._layers[idx].register_forward_hook(self._make_layer_hook(idx))
                 )
 
-        if self._lm_head is not None:
-            self._hooks.append(self._lm_head.register_forward_hook(self._make_lm_head_hook()))
-
-    def remove_hooks(self) -> None:
-        for h in self._hooks:
-            h.remove()
+    def clear_hooks(self) -> None:
+        for handle in self._hooks:
+            handle.remove()
         self._hooks.clear()
 
     # ------------------------------------------------------------------
     # State assembly
     # ------------------------------------------------------------------
 
-    def get_captured_states(self) -> CapturedStates:
+    @contextmanager
+    def capture_context(self):
+        try:
+            self.register_hooks()
+            yield self
+        finally:
+            self.clear_hooks()
+
+    def _assemble_captured_states(self) -> CapturedStates:
         """Assemble captured tensors into a CapturedStates container.
 
         Must be called after the policy forward pass and before _captured is
@@ -298,23 +264,24 @@ class HiddenStateCapture:
         """
         embeds = self._captured.get("embeds")
 
-        chunks: List[torch.Tensor] = []
+        hidden_chunks: List[torch.Tensor] = []
         for idx in sorted(self._aux_indices):
-            t = self._captured.get(f"layer_{idx}")
-            if t is not None:
-                chunks.append(t)
+            tensor = self._captured.get(f"layer_{idx}")
+            if tensor is not None:
+                hidden_chunks.append(tensor)
 
-        lm_head_logits = self._captured.get("lm_head_logits")
-
-        if not chunks:
+        if not hidden_chunks:
             return CapturedStates(
                 hidden_states=None,
                 inputs_embeds=embeds,
-                lm_head_logits=lm_head_logits,
             )
 
         return CapturedStates(
-            hidden_states=torch.cat(chunks, dim=-1),  # [batch, seq, N*hidden]
+            hidden_states=torch.cat(hidden_chunks, dim=-1),  # [batch, seq, N*hidden]
             inputs_embeds=embeds,
-            lm_head_logits=lm_head_logits,
         )
+    
+
+def get_capture_context(model, aux_layer_indices):
+    capture = HiddenStateCapture(model=model, aux_layer_indices=aux_layer_indices)
+    return capture.capture_context(), capture
