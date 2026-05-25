@@ -179,8 +179,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             try:
                 from megatron.core import parallel_state as mpu
                 pp_size = mpu.get_pipeline_model_parallel_world_size()
+                tp_size = mpu.get_tensor_model_parallel_world_size()
             except ImportError:
                 pp_size = 1
+                tp_size = 1
 
             if pp_size > 1:
                 logger.warning(
@@ -188,6 +190,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     f"parallelism (PP={pp_size} > 1).  Skipping Eagle draft init."
                 )
                 return
+            
+            if tp_size > 1:
+                logger.warning(
+                    "Eagle3 online draft training is not supported with tensor "
+                    f"parallelism (TP={tp_size} > 1).  Skipping Eagle draft init."
+                )
 
             if len(policy_model) > 1:
                 logger.warning(

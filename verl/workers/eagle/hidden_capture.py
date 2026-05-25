@@ -14,20 +14,21 @@
 
 """Captures intermediate hidden states from the policy model for Eagle3 draft training.
 
-Registers persistent forward hooks on selected decoder layers, the embedding
-layer, and the LM head.  After the policy forward pass completes,
-``get_captured_states()`` assembles the captured tensors into:
+Registers persistent forward hooks on selected decoder layers and the embedding
+layer.  After the policy forward pass completes, ``get_captured_states()``
+assembles the captured tensors into:
 
-* ``hidden_states``:   concatenation of aux-layer outputs  [batch, seq, N_aux * hidden]
-* ``inputs_embeds``:   embedding-layer output              [batch, seq, hidden]
-* ``lm_head_logits``:  LM-head output (teacher for distil) [batch, seq, vocab]
+* ``hidden_states``:  concatenation of aux-layer outputs  [batch, seq, N_aux * hidden]
+* ``inputs_embeds``:  embedding-layer output              [batch, seq, hidden]
+
+Teacher logits for distillation are taken directly from ``model_output["logits"]``
+in ``EagleLossWrapper`` — no separate LM-head hook is needed.
 
 Supported backends
 ------------------
-* **HuggingFace / FSDP**: ``model.model.embed_tokens``, ``model.model.layers``,
-  ``model.lm_head``
+* **HuggingFace / FSDP**: ``model.model.embed_tokens``, ``model.model.layers``
 * **Megatron-Core (mcore), PP=1**: ``model.embedding.word_embeddings``,
-  ``model.decoder.layers``, ``model.output_layer``
+  ``model.decoder.layers``
 
 Pipeline parallelism (PP > 1) is NOT supported: each pipeline stage holds only
 a subset of layers, so all required activations cannot be collected on a single
@@ -74,21 +75,6 @@ class CapturedStates:
     hidden_states: Optional[torch.Tensor] = None
     # [batch, seq, hidden_size]
     inputs_embeds: Optional[torch.Tensor] = None
-
-
-# ---------------------------------------------------------------------------
-# Embedding roll helper
-# ---------------------------------------------------------------------------
-
-def roll_inputs_embeds(embeds: torch.Tensor) -> torch.Tensor:
-    """Left-shift embeddings by one token for Eagle3 time-step alignment.
-
-    At position t the draft model predicts the policy distribution at t+1.
-    Rolling the embeddings left aligns draft input at t with teacher output at
-    t+1 (mirrors ``inputs_embeds[t+1]`` into position t).
-    """
-    return torch.roll(embeds, shifts=-1, dims=1)
-
 
 # ---------------------------------------------------------------------------
 # Main capture class
@@ -138,7 +124,7 @@ class HiddenStateCapture:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
             module_instances = (DDP, FSDP, Float16Module)
-        
+
         return_list = True
         if not isinstance(model, list):
             model = [model]
@@ -198,6 +184,19 @@ class HiddenStateCapture:
             "Expected model.model.embed_tokens (HF) or "
             "model.embedding.word_embeddings (Mcore)."
         )
+    
+    @staticmethod
+    def _find_lm_head(inner: nn.Module) -> nn.Module:
+        """
+        Locate the LM head
+
+        Check "lm_head", "output_layer"
+        """
+        for attr in ("lm_head", "output_layer"):
+            candidate = getattr(inner, attr, None)
+            if candidate is not None and isinstance(candidate, nn.Module):
+                return candidate
+        return None
 
     # ------------------------------------------------------------------
     # Hook construction
@@ -280,6 +279,9 @@ class HiddenStateCapture:
             hidden_states=torch.cat(hidden_chunks, dim=-1),  # [batch, seq, N*hidden]
             inputs_embeds=embeds,
         )
+    
+    def get_captured_states(self) -> CapturedStates:
+        return self._assemble_captured_states()
     
 
 def get_capture_context(model, aux_layer_indices):

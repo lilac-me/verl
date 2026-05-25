@@ -55,7 +55,6 @@ from tensordict import TensorDict
 from verl.workers.eagle.config import EagleDraftConfig
 from verl.workers.eagle.draft_model import (
     Eagle3DraftModel,
-    EagleDraftModelWrapper,
     build_eagle3_from_policy,
     get_draft_state_dict_for_vllm,
     load_eagle_draft_model,
@@ -74,7 +73,8 @@ def _unpack_fsdp_packed(
     packed: Optional[torch.Tensor],
     seq_lens: torch.Tensor,
 ) -> Optional[torch.Tensor]:
-    """Unpack a densely packed [1, total_nnz, *feat] tensor → [batch, max_seq, *feat].
+    """
+    Unpack a densely packed [1, total_nnz, *feat] tensor → [batch, max_seq, *feat].
 
     FSDP remove_padding mode concatenates sequences without any inter-sequence
     padding, so we can advance the offset by exactly ``seq_len`` each time.
@@ -99,7 +99,8 @@ def _unpack_megatron_thd(
     packed: Optional[torch.Tensor],
     seq_lens: torch.Tensor,
 ) -> Optional[torch.Tensor]:
-    """Unpack a Megatron thd-format [total_tokens_padded, *feat] tensor → [batch, max_seq, *feat].
+    """
+    Unpack a Megatron thd-format [total_tokens_padded, *feat] tensor → [batch, max_seq, *feat].
 
     In Megatron's remove_padding (thd) mode each sequence is zero-padded to a
     multiple of ``align = TP × CP × 2`` (or just TP when CP=1) before being
@@ -143,7 +144,8 @@ def _unpack_megatron_thd(
 # ---------------------------------------------------------------------------
 
 class EagleDraftManager:
-    """Owns the Eagle3 draft model, optimizer, and hidden-state capture hooks.
+    """
+    Owns the Eagle3 draft model, optimizer, and hidden-state capture hooks.
 
     Lifecycle::
 
@@ -159,14 +161,14 @@ class EagleDraftManager:
 
     def __init__(
         self,
-        draft_model: EagleDraftModelWrapper,
+        draft_model: nn.Module,
         capture: HiddenStateCapture,
         config: EagleDraftConfig,
         optimizer: torch.optim.Optimizer,
     ):
-        self.draft_model = draft_model
-        self.capture = capture
         self.config = config
+        self.capture = capture
+        self.draft_model = draft_model
         self.optimizer = optimizer
 
         # Register hooks once — they remain active for the training lifetime
@@ -182,7 +184,8 @@ class EagleDraftManager:
         device: Optional[torch.device] = None,
         hf_config=None,
     ) -> "EagleDraftManager":
-        """Factory: load or build draft model, register hooks, build optimizer.
+        """
+        Factory: load or build draft model, register hooks, build optimizer.
 
         Path A (``eagle_config.model_path`` is set): loads a pretrained HF
         Eagle3 checkpoint via ``load_eagle_draft_model``.
@@ -268,11 +271,14 @@ class EagleDraftManager:
         gradient hook).
         """
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            world_size = dist.get_world_size()
+            from megatron.core import parallel_state as mpu
+            dp_group = mpu.get_data_parallel_group()
+            dp_world_size = mpu.get_data_parallel_world_size()
+
             for p in self.draft_model.parameters():
                 if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                    p.grad.div_(world_size)
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=dp_group)
+                    p.grad.div_(dp_world_size)
 
         torch.nn.utils.clip_grad_norm_(
             [p for p in self.draft_model.parameters() if p.requires_grad],
@@ -291,7 +297,9 @@ class EagleDraftManager:
 
     def save_pretrained(self, path: str) -> None:
         """Save the draft model in HuggingFace format for checkpointing."""
-        inner = self.draft_model.draft_model
+        # Path A: EagleDraftModelWrapper wraps the HF model in .draft_model
+        # Path B: Eagle3DraftModel is saved directly
+        inner = getattr(self.draft_model, "draft_model", self.draft_model)
         if hasattr(inner, "save_pretrained"):
             inner.save_pretrained(path)
         else:
@@ -304,9 +312,10 @@ class EagleDraftManager:
 # ---------------------------------------------------------------------------
 
 class EagleLossWrapper:
-    """Wraps a policy-loss callable with Eagle3 draft distillation.
+    """
+    Wraps a policy-loss callable with Eagle3 draft distillation.
 
-    Injected as the ``loss_fn`` of the FSDP / Megatron TrainingWorker.
+    Injected as the ``loss_fn`` of the Megatron TrainingWorker.
     Called once per micro-batch inside the engine's forward-backward loop:
 
         total_loss, metrics = wrapper(model_output, data, dp_group)
@@ -376,7 +385,7 @@ class EagleLossWrapper:
             inputs_embeds = captured.inputs_embeds
 
         # 4. Eagle3 time-step alignment roll ------------------------------------
-        rolled_embeds = roll_inputs_embeds(inputs_embeds)
+        rolled_embeds = torch.roll(inputs_embeds, shifts=-1, dims=1)
 
         # 5. Draft model forward ------------------------------------------------
         response_mask = data.get("response_mask", None)
