@@ -76,21 +76,12 @@ class EagleDraftConfig(BaseConfig):
     the speculative-decoding acceptance rate high as the policy evolves during
     RL training.
 
-    Example YAML::
-
-        actor_rollout_ref:
-          model:
-            eagle_draft:
-              enabled: true
-              model_path: /path/to/eagle3-draft
-              loss_weight: 0.1
-              optimizer:
-                lr: 1.0e-4
-                weight_decay: 0.0
     """
 
     enabled: bool = False
     model_path: Optional[str] = None
+    # Number of transformer decoder layers in the built draft model (Path B only)
+    num_draft_layers: int = 1
     # Scaling factor λ: total_loss = policy_loss + λ * draft_loss
     loss_weight: float = 0.1
     # null → auto Eagle3 heuristic (1, num_layers//2-1, num_layers-4)
