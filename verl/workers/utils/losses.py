@@ -14,6 +14,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -184,3 +185,56 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     )
 
     return vf_loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# Eagle3 draft-model distillation loss
+# ---------------------------------------------------------------------------
+
+def roll_for_eagle_alignment(
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple:
+    """Align teacher logits to the draft's prediction target.
+
+    manager.py shifts inputs_embeds left by 1 before the draft forward, so
+    draft_logits[t] is computed from [H_t, embed(x_{t+1})] and predicts x_{t+2}.
+    In HF convention teacher_logits[t+1] also predicts x_{t+2}, so rolling
+    teacher left by 1 brings them into correspondence:
+
+        draft_logits[t]  ↔  rolled_teacher[t] = teacher_logits[t+1]
+
+    draft_logits are NOT rolled — the embed shift already places the draft one
+    step ahead.  The last position (wrap-around artifact) is masked out.
+    """
+    teacher_logits = torch.roll(teacher_logits, shifts=-1, dims=1)
+    response_mask = torch.roll(response_mask, shifts=-1, dims=1).clone()
+    response_mask[:, -1] = 0
+    return teacher_logits, response_mask
+
+
+def eagle_draft_loss(
+    draft_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Forward-KL distillation loss for the Eagle3 draft model.
+
+    Applies Eagle3 time-step alignment roll, then computes soft cross-entropy
+    between the draft distribution and the (detached) policy distribution.
+    The caller is responsible for scaling by loss_weight.
+
+    Args:
+        draft_logits:   [batch, seq, vocab] — draft model output (float32)
+        teacher_logits: [batch, seq, vocab] — policy LM-head logits, detached
+        response_mask:  [batch, seq]        — 1 for response tokens
+
+    Returns:
+        Unscaled scalar loss.
+    """
+    teacher_logits, response_mask = roll_for_eagle_alignment(teacher_logits, response_mask)
+    teacher_probs = F.softmax(teacher_logits, dim=-1)
+    student_log_probs = F.log_softmax(draft_logits, dim=-1)
+    per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
+    num_valid = response_mask.float().sum().clamp(min=1)
+    return (per_token_loss * response_mask.float()).sum() / num_valid

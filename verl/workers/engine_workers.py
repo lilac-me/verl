@@ -146,6 +146,76 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self._eagle_manager = None  # set by init_eagle_draft when enabled
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_eagle_draft(self, eagle_config) -> None:
+        """Initialize the Eagle3 draft model and install the distillation loss wrapper.
+
+        Must be called after ``reset()`` (model weights loaded).  Replaces
+        ``self.loss_fn`` with an ``EagleLossWrapper`` that appends the draft
+        distillation term to the policy gradient loss.
+
+        Megatron pipeline parallelism (PP > 1) is not supported: hook-based
+        hidden-state capture cannot collect activations from multiple PP stages
+        on a single rank.
+        """
+        from verl.workers.eagle import EagleDraftConfig, EagleDraftManager
+
+        if isinstance(eagle_config, dict):
+            eagle_config = EagleDraftConfig(**eagle_config)
+
+        if not eagle_config.enabled:
+            return
+
+        if self._eagle_manager is not None:
+            logger.warning("Eagle3 draft manager already initialised; skipping re-init.")
+            return
+
+        policy_model = self.engine.module
+
+        # Megatron: engine.module is a list[GPTModel] (one chunk per VPP stage)
+        if isinstance(policy_model, list):
+            try:
+                from megatron.core import parallel_state as mpu
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
+            except ImportError:
+                pp_size = 1
+
+            if pp_size > 1:
+                logger.warning(
+                    "Eagle3 online draft training is not supported with pipeline "
+                    f"parallelism (PP={pp_size} > 1).  Skipping Eagle draft init."
+                )
+                return
+            
+            if len(policy_model) > 1:
+                logger.warning(
+                    "Eagle3 online draft training is not supported with virtual "
+                    f"pipeline parallelism (VPP={len(policy_model)} > 1).  Skipping."
+                )
+                return
+
+            # PP=1, VPP=1 — unwrap the single-element list
+            policy_model = policy_model[0]
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        hf_config = getattr(self.model_config, "hf_config", None)
+        self._eagle_manager = EagleDraftManager.build(
+            policy_model=policy_model,
+            eagle_config=eagle_config,
+            torch_dtype=torch.bfloat16,
+            device=device,
+            hf_config=hf_config,
+        )
+
+        if self.loss_fn is not None:
+            self.loss_fn = self._eagle_manager.make_loss_wrapper(self.loss_fn)
+            logger.info("Eagle3 draft model initialised; loss wrapper installed.")
+        else:
+            logger.warning(
+                "Eagle3 manager built but loss_fn is None — call set_loss_fn() first."
+            )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -351,6 +421,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
+
+        # Step the Eagle3 draft optimizer (separate from the policy FSDP/Megatron
+        # optimizer).  Must be called after engine.train_batch() completes so that
+        # gradients have been accumulated across all micro-batches.
+        if self._eagle_manager is not None:
+            self._eagle_manager.optimizer_step()
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -579,6 +655,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
+            # Eagle3 online draft-model training
+            eagle_draft_cfg = model_config.get("eagle_draft", None)
+            if eagle_draft_cfg is not None and getattr(eagle_draft_cfg, "enabled", False):
+                self.actor.init_eagle_draft(eagle_draft_cfg)
+
         # 3. build rollout engine
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
@@ -723,6 +804,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         log_gpu_memory_usage("After update_weights", logger=logger)
+
+        # Eagle3 draft weight sync: push updated draft-model parameters to the
+        # vLLM Eagle3 proposer so its distribution tracks the evolving policy.
+        eagle_manager = getattr(self.actor, "_eagle_manager", None)
+        if eagle_manager is not None:
+            draft_weights = eagle_manager.state_dict_for_vllm()
+            await self.rollout.update_eagle_draft_weights(
+                draft_weights, global_steps=global_steps
+            )
+            log_gpu_memory_usage("After update_eagle_draft_weights", logger=logger)
 
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:

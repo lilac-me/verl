@@ -23,7 +23,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
+__all__ = ["HFModelConfig", "MtpConfig", "EagleDraftConfig"]
 
 
 @dataclass
@@ -68,6 +68,34 @@ class MtpConfig(BaseConfig):
 
 
 @dataclass
+class EagleDraftConfig(BaseConfig):
+    """Configuration for Eagle3 online draft-model training (Megatron backend).
+
+    The Eagle3 draft model is a standalone HuggingFace model trained alongside
+    the policy via distillation from the policy's LM-head logits.  It keeps
+    the speculative-decoding acceptance rate high as the policy evolves during
+    RL training.
+
+    """
+
+    enabled: bool = False
+    model_path: Optional[str] = None
+    # Number of transformer decoder layers in the built draft model (Path B only)
+    num_draft_layers: int = 1
+    # Scaling factor λ: total_loss = policy_loss + λ * draft_loss
+    loss_weight: float = 0.1
+    # null → auto Eagle3 heuristic (1, num_layers//2-1, num_layers-4)
+    aux_layer_indices: Optional[Any] = None
+
+    @dataclass
+    class _OptimizerConfig(BaseConfig):
+        lr: float = 1e-4
+        weight_decay: float = 0.0
+
+    optimizer: "_OptimizerConfig" = field(default_factory=_OptimizerConfig)
+
+
+@dataclass
 class HFModelConfig(BaseConfig):
     # note that we separate model_path, model_config_path and tokenizer_path in case they are different
     _mutable_fields = {
@@ -83,6 +111,7 @@ class HFModelConfig(BaseConfig):
         "local_hf_config_path",
         "local_tokenizer_path",
         "mtp",
+        "eagle_draft",
     }
 
     path: str = MISSING
@@ -144,6 +173,9 @@ class HFModelConfig(BaseConfig):
     architectures: Optional[list[str]] = None
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    # Eagle3 online draft-model training (Megatron backend)
+    eagle_draft: EagleDraftConfig = field(default_factory=EagleDraftConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
