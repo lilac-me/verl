@@ -59,7 +59,7 @@ from verl.workers.eagle.draft_model import (
     get_draft_state_dict_for_vllm,
     load_eagle_draft_model,
 )
-from verl.workers.eagle.hidden_capture import HiddenStateCapture, get_eagle3_aux_layer_indices, roll_inputs_embeds
+from verl.workers.eagle.hidden_capture import HiddenStateCapture, get_eagle3_aux_layer_indices
 from verl.workers.utils.losses import eagle_draft_loss
 
 logger = logging.getLogger(__name__)
@@ -68,32 +68,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Tensor unpack helpers
 # ---------------------------------------------------------------------------
-
-def _unpack_fsdp_packed(
-    packed: Optional[torch.Tensor],
-    seq_lens: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    """
-    Unpack a densely packed [1, total_nnz, *feat] tensor → [batch, max_seq, *feat].
-
-    FSDP remove_padding mode concatenates sequences without any inter-sequence
-    padding, so we can advance the offset by exactly ``seq_len`` each time.
-    """
-    if packed is None:
-        return None
-    if not (packed.dim() >= 2 and packed.shape[0] == 1):
-        return packed  # already padded batch-first format
-    batch = seq_lens.shape[0]
-    max_seq = int(seq_lens.max().item())
-    feat = packed.shape[2:]
-    out = packed.new_zeros(batch, max_seq, *feat)
-    offset = 0
-    for i, length in enumerate(seq_lens.tolist()):
-        length = int(length)
-        out[i, :length] = packed[0, offset : offset + length]
-        offset += length
-    return out
-
 
 def _unpack_megatron_thd(
     packed: Optional[torch.Tensor],
@@ -107,21 +81,14 @@ def _unpack_megatron_thd(
     concatenated.  We recompute the per-sequence padded length to correctly
     advance the offset between sequences.
 
-    Falls back to FSDP-style unpack for 3-D tensors.
     """
     if packed is None:
         return None
-    if packed.dim() != 2:
-        # Unexpected shape or 3-D [1, total, feat] — delegate to FSDP unpacker
-        return _unpack_fsdp_packed(packed, seq_lens)
 
     # Compute alignment from Megatron parallel state (mirrors preprocess_thd_engine)
-    try:
-        from megatron.core import parallel_state as mpu
-        tp = mpu.get_tensor_model_parallel_world_size()
-        cp = mpu.get_context_parallel_world_size()
-    except ImportError:
-        tp, cp = 1, 1
+    from megatron.core import parallel_state as mpu
+    tp = mpu.get_tensor_model_parallel_world_size()
+    cp = mpu.get_context_parallel_world_size()
     align = max(tp * cp * 2 if cp > 1 else tp, 1)
 
     batch = seq_lens.shape[0]
@@ -361,9 +328,8 @@ class EagleLossWrapper:
             return policy_loss, metrics
         teacher_logits = teacher_logits.detach().float()
 
-        # 3. Unpack packed tensors -----------------------------------------------
-        # Both FSDP and Megatron remove_padding modes mark input_ids as a nested
-        # tensor, with per-sequence lengths accessible via .offsets().
+        # 3. Unpack Megatron thd packed tensors ---------------------------------
+        # Megatron remove_padding (thd) mode marks input_ids as a nested tensor.
         input_ids = data.get("input_ids", None)
         if (
             input_ids is not None
@@ -371,18 +337,15 @@ class EagleLossWrapper:
             and input_ids.is_nested
         ):
             seq_lens = input_ids.offsets().diff()  # [batch]
-
-            # Dispatch: 2-D packed → Megatron thd; 3-D [1, total, feat] → FSDP
-            hs = captured.hidden_states
-            _unpack = _unpack_megatron_thd if (hs is not None and hs.dim() == 2) else _unpack_fsdp_packed
-
-            hidden_states = _unpack(captured.hidden_states, seq_lens)
-            inputs_embeds = _unpack(captured.inputs_embeds, seq_lens)
-            teacher_logits = _unpack(teacher_logits, seq_lens)
+            hidden_states = _unpack_megatron_thd(captured.hidden_states, seq_lens)
+            inputs_embeds = _unpack_megatron_thd(captured.inputs_embeds, seq_lens)
+            teacher_logits = _unpack_megatron_thd(teacher_logits, seq_lens)
         else:
             # No packing: tensors are already [batch, seq, feat]
             hidden_states = captured.hidden_states
             inputs_embeds = captured.inputs_embeds
+
+        assert hidden_states is not None and inputs_embeds is not None
 
         # 4. Eagle3 time-step alignment roll ------------------------------------
         rolled_embeds = torch.roll(inputs_embeds, shifts=-1, dims=1)
@@ -410,10 +373,9 @@ class EagleLossWrapper:
             draft_logits=draft_logits.float(),
             teacher_logits=teacher_logits,
             response_mask=response_mask_t,
-            loss_weight=self.manager.config.loss_weight,
         )
 
-        total_loss = policy_loss + draft_loss
+        total_loss = policy_loss + self.manager.config.loss_weight * draft_loss
         metrics["actor/eagle_draft_loss"] = draft_loss.detach().item()
 
         return total_loss, metrics

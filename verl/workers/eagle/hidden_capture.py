@@ -58,7 +58,7 @@ def get_eagle3_aux_layer_indices(num_layers: int) -> Tuple[int, ...]:
     candidates = (
         1,
         max(0, num_layers // 2 - 1),
-        max(1, num_layers - 4),
+        max(1, num_layers - 1),
     )
     return tuple(sorted(set(candidates)))
 
