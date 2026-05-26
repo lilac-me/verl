@@ -26,8 +26,8 @@ Both expose the same forward signature::
 
 eagle_output_layer design
 --------------------------
-``Eagle3DraftModel.eagle_output_layer`` is a ``VocabParallelLinear`` that mirrors
-Megatron's ``ColumnParallelLinear(gather_output=True)`` semantics:
+``Eagle3DraftModel.eagle_output_layer`` is a Megatron
+``ColumnParallelLinear(gather_output=True)`` with ``requires_grad=False``:
 
 * Each TP rank stores only the local weight shard ``[vocab / TP, H]``.
 * ``forward`` computes local logits ``[B, S, vocab / TP]`` then calls
@@ -48,52 +48,8 @@ from typing import Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Vocab-parallel output projection (mirrors ColumnParallelLinear)
-# ---------------------------------------------------------------------------
-
-class VocabParallelLinear(nn.Module):
-    """Frozen output projection with TP-aware forward pass.
-
-    Holds the local weight shard ``[vocab / TP, hidden_size]``.  During
-    ``forward`` a ``gather_from_tensor_model_parallel_region`` call assembles
-    the full-vocabulary logits across TP ranks.  With TP = 1 the gather is a
-    no-op and this is equivalent to a plain ``nn.Linear``.
-
-    ``requires_grad`` is always ``False``; gradients propagate through the
-    weight matrix to upstream layers via the chain rule.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        vocab_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        super().__init__()
-        from megatron.core import parallel_state
-
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        assert vocab_size % tp_size == 0, (
-            f"vocab_size {vocab_size} must be divisible by TP size {tp_size}"
-        )
-        local_vocab_size = vocab_size // tp_size
-        self.weight = nn.Parameter(
-            torch.empty(local_vocab_size, hidden_size, dtype=dtype, device=device),
-            requires_grad=False,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from megatron.core.tensor_parallel import gather_from_tensor_model_parallel_region
-
-        local_logits = F.linear(x, self.weight)           # [B, S, vocab/TP]
-        return gather_from_tensor_model_parallel_region(local_logits)  # [B, S, vocab]
 
 
 def _gather_tp_weight(local_weight: torch.Tensor) -> torch.Tensor:
@@ -188,21 +144,21 @@ class Eagle3DraftModel(nn.Module):
         Input: [h_aux_1 ‖ … ‖ h_aux_N ‖ embed(t+1)]   (concatenated)
           → fc                : Linear((N_aux+1)*H → H, bias=False)
           → eagle_module      : HF transformer (num_draft_layers layers)
-          → eagle_output_layer: VocabParallelLinear — frozen, TP-sharded
+          → eagle_output_layer: ColumnParallelLinear(gather_output=True) — frozen, TP-sharded
 
     Attributes:
         fc                 : feature-fusion linear.
         eagle_module       : shallow HF transformer.
-        eagle_output_layer : frozen TP-sharded vocab projection.
+        eagle_output_layer : frozen Megatron ColumnParallelLinear (gather_output=True).
         _policy_lm_head_ref: reference to the policy's LM head used by
-            ``sync_lm_head``. Set by ``EagleDraftManager`` after construction.
+            ``sync_lm_head``. Set by ``build_eagle3_from_policy`` after construction.
     """
 
     def __init__(
         self,
         fc: nn.Linear,
         eagle_module: nn.Module,
-        eagle_output_layer: VocabParallelLinear,
+        eagle_output_layer: nn.Module,
     ):
         super().__init__()
         self.fc = fc
@@ -232,15 +188,16 @@ class Eagle3DraftModel(nn.Module):
         outputs = self.eagle_module(inputs_embeds=x, attention_mask=attention_mask)
         x = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
 
-        # VocabParallelLinear: local matmul → gather_from_tensor_model_parallel_region
-        return self.eagle_output_layer(x)
+        # ColumnParallelLinear(gather_output=True): returns (logits, bias)
+        logits, _ = self.eagle_output_layer(x)
+        return logits
 
     def sync_lm_head(self, policy_lm_head: Optional[nn.Module] = None) -> None:
         """Copy the policy's local lm-head shard into eagle_output_layer.
 
         Both the policy's ``output_layer`` (Megatron ColumnParallelLinear) and
-        ``eagle_output_layer`` (VocabParallelLinear) hold the same-shaped local
-        shard ``[vocab / TP, H]``, so a direct copy suffices — no all-gather.
+        ``eagle_output_layer`` hold the same-shaped local shard ``[vocab / TP, H]``,
+        so a direct copy suffices — no all-gather.
 
         Should be called after each policy optimizer step.
         """
@@ -277,9 +234,10 @@ def build_eagle3_from_policy(
        created from ``hf_config`` via ``AutoModel.from_config``, then
        initialised from the policy's last ``num_draft_layers`` decoder layers
        (``strict=False`` so mismatching keys are skipped gracefully).
-    3. ``eagle_output_layer``: ``VocabParallelLinear`` initialised from the
-       policy's local lm-head weight shard.  No all-gather — both sides hold
-       ``[vocab / TP, H]`` shards on the same TP rank.
+    3. ``eagle_output_layer``: Megatron ``ColumnParallelLinear(gather_output=True)``
+       initialised from the policy's local lm-head weight shard.  No all-gather —
+       both sides hold ``[vocab / TP, H]`` shards on the same TP rank.
+       Weight is frozen (``requires_grad=False``).
 
     Args:
         policy_model:     The policy ``nn.Module`` (unwrapped, single chunk).
@@ -289,6 +247,7 @@ def build_eagle3_from_policy(
         torch_dtype:      Weight dtype (default bfloat16).
         device:           Target CUDA device.
     """
+    from megatron.core.tensor_parallel import ColumnParallelLinear
     from transformers import AutoModel
 
     from verl.workers.eagle.hidden_capture import HiddenStateCapture
@@ -333,11 +292,11 @@ def build_eagle3_from_policy(
         )
 
     # ------------------------------------------------------------------
-    # 3. VocabParallelLinear — frozen, TP-sharded, init from policy shard
+    # 3. ColumnParallelLinear — frozen, TP-sharded, init from policy shard
     #
     # Both policy.output_layer (ColumnParallelLinear) and eagle_output_layer
-    # (VocabParallelLinear) hold [vocab/TP, H] on each TP rank, so we copy
-    # the local shard directly without any all-gather.
+    # hold [vocab/TP, H] on each TP rank, so we copy the local shard directly
+    # without any all-gather.
     # ------------------------------------------------------------------
     policy_lm_head = HiddenStateCapture._find_lm_head(policy_model)
     if policy_lm_head is None:
@@ -346,12 +305,15 @@ def build_eagle3_from_policy(
             "Expected model.lm_head (HF) or model.output_layer (Mcore)."
         )
 
-    lm_head = VocabParallelLinear(
-        hidden_size=hidden_size,
-        vocab_size=hf_config.vocab_size,
-        dtype=torch_dtype,
-        device=device,
+    lm_head = ColumnParallelLinear(
+        input_size=hidden_size,
+        output_size=hf_config.vocab_size,
+        bias=False,
+        gather_output=True,
+        params_dtype=torch_dtype,
     )
+    lm_head = lm_head.to(device=device)
+    lm_head.weight.requires_grad_(False)
     with torch.no_grad():
         src_weight = getattr(policy_lm_head, "weight")
         lm_head.weight.copy_(src_weight.to(dtype=torch_dtype, device=device))
