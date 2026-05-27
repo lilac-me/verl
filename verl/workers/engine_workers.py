@@ -200,13 +200,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             policy_model = policy_model[0]
 
         device = torch.device("cuda", torch.cuda.current_device())
-        hf_config = getattr(self.model_config, "hf_config", None)
         self._eagle_manager = EagleDraftManager.build(
             policy_model=policy_model,
             eagle_config=eagle_config,
             torch_dtype=torch.bfloat16,
             device=device,
-            hf_config=hf_config,
         )
 
         if self.loss_fn is not None:
@@ -422,11 +420,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # for training, we only care about loss and metrics
         delta_time = timer.last
 
-        # Step the Eagle3 draft optimizer (separate from the policy FSDP/Megatron
-        # optimizer).  Must be called after engine.train_batch() completes so that
-        # gradients have been accumulated across all micro-batches.
+        # Step the Eagle3 draft optimizer after policy train_batch completes,
+        # then re-sync the draft output layer from the updated policy lm_head.
         if self._eagle_manager is not None:
             self._eagle_manager.optimizer_step()
+            self._eagle_manager.sync_lm_head()
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler

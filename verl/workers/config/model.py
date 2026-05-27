@@ -71,21 +71,29 @@ class MtpConfig(BaseConfig):
 class EagleDraftConfig(BaseConfig):
     """Configuration for Eagle3 online draft-model training (Megatron backend).
 
-    The Eagle3 draft model is a standalone HuggingFace model trained alongside
-    the policy via distillation from the policy's LM-head logits.  It keeps
-    the speculative-decoding acceptance rate high as the policy evolves during
-    RL training.
+    The Eagle3 draft model is a pretrained HuggingFace Eagle3 checkpoint trained
+    alongside the policy via distillation from the policy's LM-head logits.  It
+    keeps the speculative-decoding acceptance rate high as the policy evolves
+    during RL training.
 
+    ``draft_vocab_size`` and ``aux_layer_indices`` are auto-populated from the
+    Eagle model's config.json in HFModelConfig.__post_init__ when enabled.
     """
 
+    # Populated at runtime from Eagle HF config.json
+    _mutable_fields = {"draft_vocab_size", "aux_layer_indices"}
+
     enabled: bool = False
+    # Path to a pretrained HuggingFace Eagle3 checkpoint
     model_path: Optional[str] = None
-    # Number of transformer decoder layers in the built draft model (Path B only)
-    num_draft_layers: int = 1
+    # Number of draft tokens proposed per decoding step (passed to vLLM speculative_config)
+    num_speculative_tokens: int = 1
     # Scaling factor λ: total_loss = policy_loss + λ * draft_loss
     loss_weight: float = 0.1
-    # null → auto Eagle3 heuristic (1, num_layers//2-1, num_layers-4)
+    # null → auto Eagle3 heuristic; populated from hf_cfg.aux_layer_indices if available
     aux_layer_indices: Optional[Any] = None
+    # Populated from Eagle hf_cfg.draft_vocab_size (may be smaller than base model vocab)
+    draft_vocab_size: Optional[int] = None
 
     @dataclass
     class _OptimizerConfig(BaseConfig):
@@ -260,6 +268,23 @@ class HFModelConfig(BaseConfig):
                 self.hf_config.mtp_num_hidden_layers = 0
             if hasattr(self.hf_config, "text_config") and hasattr(self.hf_config.text_config, "mtp_num_hidden_layers"):
                 self.hf_config.text_config.mtp_num_hidden_layers = 0
+
+        # Load Eagle3 draft config.json and populate EagleDraftConfig fields
+        if self.eagle_draft.enabled and self.eagle_draft.model_path is not None:
+            try:
+                eagle_hf_cfg = AutoConfig.from_pretrained(
+                    self.eagle_draft.model_path, trust_remote_code=self.trust_remote_code
+                )
+                if self.eagle_draft.draft_vocab_size is None:
+                    self.eagle_draft.draft_vocab_size = getattr(
+                        eagle_hf_cfg, "draft_vocab_size", eagle_hf_cfg.vocab_size
+                    )
+                if self.eagle_draft.aux_layer_indices is None:
+                    eagle_aux = getattr(eagle_hf_cfg, "aux_layer_indices", None)
+                    if eagle_aux is not None:
+                        self.eagle_draft.aux_layer_indices = list(eagle_aux)
+            except Exception:
+                pass
 
         # Ensure target_modules is a str or list[str] (only if not None)
         if self.target_modules is not None:

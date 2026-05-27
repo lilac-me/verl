@@ -58,7 +58,7 @@ def get_eagle3_aux_layer_indices(num_layers: int) -> Tuple[int, ...]:
     candidates = (
         1,
         max(0, num_layers // 2 - 1),
-        max(1, num_layers - 1),
+        max(1, num_layers - 4),
     )
     return tuple(sorted(set(candidates)))
 
@@ -71,9 +71,9 @@ def get_eagle3_aux_layer_indices(num_layers: int) -> Tuple[int, ...]:
 class CapturedStates:
     """Tensors captured from the policy model during a single forward pass."""
 
-    # [batch, seq, N_aux * hidden_size]
+    # [seq, batch, N_aux * hidden_size]
     hidden_states: Optional[torch.Tensor] = None
-    # [batch, seq, hidden_size]
+    # [seq, batch, hidden_size]
     inputs_embeds: Optional[torch.Tensor] = None
 
 # ---------------------------------------------------------------------------
