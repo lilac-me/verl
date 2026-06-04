@@ -106,6 +106,12 @@ class ServerAdapter(BaseRollout):
         local_rank = self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        # Dedicated socket for Eagle3 draft-model weight transfer (avoids collision
+        # with the concurrent policy weight sync on the main zmq_handle).
+        self.zmq_handle_eagle_draft = (
+            f"ipc:///tmp/rl-colocate-zmq-eagle-draft-{job_id}"
+            f"-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        )
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
@@ -193,6 +199,42 @@ class ServerAdapter(BaseRollout):
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+
+    @torch.no_grad()
+    async def update_eagle_draft_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int = None,
+    ):
+        """Sync updated Eagle3 draft-model weights to the vLLM Eagle3 proposer.
+
+        Uses a dedicated ZMQ socket (``zmq_handle_eagle_draft``) so that this
+        transfer does not collide with the concurrent policy weight sync on
+        ``zmq_handle``.
+        """
+        start_time = time.time()
+
+        future = await self._execute_method(
+            "update_eagle_draft_weights_from_ipc",
+            non_block=True,
+            kwargs={"use_shm": self.use_shm},
+        )
+
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle_eagle_draft,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        await sender.async_send_weights(weights)
+
+        if future is not None:
+            await future
+
+        if self.replica_rank == 0 and self.rollout_rank == 0:
+            logger.info(
+                f"update_eagle_draft_weights done, time cost: {time.time() - start_time:.2f}s"
+            )
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

@@ -23,7 +23,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
+__all__ = ["HFModelConfig", "MtpConfig", "EagleDraftConfig"]
 
 
 @dataclass
@@ -68,6 +68,39 @@ class MtpConfig(BaseConfig):
 
 
 @dataclass
+class EagleDraftConfig(BaseConfig):
+    """Configuration for Eagle3 online draft-model training (Megatron backend).
+
+    The Eagle3 draft model is a pretrained HuggingFace Eagle3 checkpoint trained
+    alongside the policy via distillation from the policy's LM-head logits.  It
+    keeps the speculative-decoding acceptance rate high as the policy evolves
+    during RL training.
+
+    ``draft_vocab_size`` and ``eagle_aux_hidden_state_layer_ids`` are auto-populated from the
+    Eagle model's config.json in HFModelConfig.__post_init__ when enabled.
+    """
+
+    _mutable_fields = {"draft_vocab_size", "eagle_aux_hidden_state_layer_ids"}
+
+    enabled: bool = False
+    # Path to a pretrained HuggingFace Eagle3 checkpoint
+    model_path: Optional[str] = None
+    # Number of draft tokens proposed per decoding step (passed to vLLM speculative_config)
+    num_speculative_tokens: int = 1
+    # Scaling factor λ: total_loss = policy_loss + λ * draft_loss
+    loss_weight: float = 0.1
+    eagle_aux_hidden_state_layer_ids: Optional[Any] = None
+    draft_vocab_size: Optional[int] = None
+
+    @dataclass
+    class _OptimizerConfig(BaseConfig):
+        lr: float = 1e-4
+        weight_decay: float = 0.0
+
+    optimizer: "_OptimizerConfig" = field(default_factory=_OptimizerConfig)
+
+
+@dataclass
 class HFModelConfig(BaseConfig):
     # note that we separate model_path, model_config_path and tokenizer_path in case they are different
     _mutable_fields = {
@@ -83,6 +116,7 @@ class HFModelConfig(BaseConfig):
         "local_hf_config_path",
         "local_tokenizer_path",
         "mtp",
+        "eagle_draft",
     }
 
     path: str = MISSING
@@ -144,6 +178,9 @@ class HFModelConfig(BaseConfig):
     architectures: Optional[list[str]] = None
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    # Eagle3 online draft-model training (Megatron backend)
+    eagle_draft: EagleDraftConfig = field(default_factory=EagleDraftConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
@@ -228,6 +265,20 @@ class HFModelConfig(BaseConfig):
                 self.hf_config.mtp_num_hidden_layers = 0
             if hasattr(self.hf_config, "text_config") and hasattr(self.hf_config.text_config, "mtp_num_hidden_layers"):
                 self.hf_config.text_config.mtp_num_hidden_layers = 0
+
+        # Load Eagle3 draft config.json and populate EagleDraftConfig fields
+        if self.eagle_draft.enabled and self.eagle_draft.model_path is not None:
+            eagle_hf_config = AutoConfig.from_pretrained(
+                self.eagle_draft.model_path, trust_remote_code=self.trust_remote_code
+            )
+            if self.eagle_draft.draft_vocab_size is None:
+                self.eagle_draft.draft_vocab_size = getattr(
+                    eagle_hf_config, "draft_vocab_size", eagle_hf_config.vocab_size
+                )
+            if self.eagle_draft.eagle_aux_hidden_state_layer_ids is None:
+                eagle_aux = getattr(eagle_hf_config, "eagle_aux_hidden_state_layer_ids", None)
+                if eagle_aux is not None:
+                    self.eagle_draft.eagle_aux_hidden_state_layer_ids = list(eagle_aux)
 
         # Ensure target_modules is a str or list[str] (only if not None)
         if self.target_modules is not None:

@@ -298,6 +298,14 @@ class vLLMHttpServer:
             }
             args["speculative_config"] = speculative_config
 
+        eagle_draft = getattr(self.model_config, "eagle_draft", None)
+        if eagle_draft is not None and eagle_draft.enabled and eagle_draft.model_path:
+            args["speculative_config"] = {
+                "method": "eagle",
+                "model": eagle_draft.model_path,
+                "num_speculative_tokens": eagle_draft.num_speculative_tokens,
+            }
+
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"
