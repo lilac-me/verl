@@ -154,6 +154,11 @@ class vLLMColocateWorkerExtension:
 
         # 1. patch for Lora
         VLLMHijack.hijack()
+        # 1b. eagle3: ensure the drafter owns a refit-loadable lm_head (no-op
+        # when the eagle3 module is absent or already compliant)
+        from verl.workers.rollout.vllm_rollout.eagle3_utils import maybe_patch_eagle3_lm_head_ownership
+
+        maybe_patch_eagle3_lm_head_ownership()
         # 2. patch online fp8 quant
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1":
             apply_vllm_fp8_patches()
@@ -201,6 +206,18 @@ class vLLMColocateWorkerExtension:
         spec = self.model_runner.vllm_config.speculative_config
         return spec is not None and spec.method == "mtp" and self._get_drafter_model() is not None
 
+    def _drafter_sync_mode(self) -> str:
+        """none | mtp_shared (drafter gets a copy of actor weights) |
+        eagle3_owned (drafter gets trainer-owned 'draft.'-prefixed weights)."""
+        spec = self.model_runner.vllm_config.speculative_config
+        if spec is None or self._get_drafter_model() is None:
+            return "none"
+        if spec.method == "mtp":
+            return "mtp_shared"
+        if spec.method == "eagle3":
+            return "eagle3_owned"
+        return "none"
+
     def _iter_all_models(self):
         """Yield models that need weight updates.
 
@@ -214,7 +231,7 @@ class vLLMColocateWorkerExtension:
     def _iter_all_models_with_config(self):
         """Yield (model, model_config) for models that need post-processing."""
         yield self.model_runner.model, self.model_runner.vllm_config.model_config
-        if self._use_mtp_drafter_weight_sync():
+        if self._drafter_sync_mode() in ("mtp_shared", "eagle3_owned"):
             draft_cfg = self._get_draft_model_config()
             if draft_cfg is not None:
                 yield self._get_drafter_model(), draft_cfg
@@ -304,6 +321,13 @@ class vLLMColocateWorkerExtension:
         return loaded
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+        from verl.workers.rollout.vllm_rollout.eagle3_utils import load_draft_weights, split_draft_weights
+
+        # trainer-owned eagle3 drafter weights arrive under the 'draft.' prefix;
+        # split them out before any policy-weight processing (MTP drafter sync is
+        # unaffected: it copies actor weights via _iter_all_models instead).
+        weights, eagle3_draft_weights = split_draft_weights(weights)
+
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -339,6 +363,9 @@ class vLLMColocateWorkerExtension:
                     f"Loading standard weights (non-FP8, async), "
                     f"loaded_params: {len(param_updates)}, loaded_buffers: {loaded_buffers}"
                 )
+
+        if eagle3_draft_weights:
+            load_draft_weights(self.model_runner, eagle3_draft_weights)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

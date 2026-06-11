@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import inspect
 import logging
 import os
@@ -390,6 +391,21 @@ class MegatronEngine(BaseEngine):
             for model in self.module:
                 patch_postprocess(model)
 
+        # === EAGLE3 online draft training (trainer-owned drafter) ===
+        # Standalone module + own optimizer: see draft_plugin.py docstring for
+        # why it is NOT attached to the (already DDP-wrapped) policy chunks.
+        from verl.models.mcore.draft.config import DraftModelConfig, validate_draft_config
+        from verl.workers.engine.megatron.draft_plugin import MegatronDraftTrainerPlugin
+
+        _draft_dict = {}
+        if not self.is_value_model and not self.engine_config.forward_only:
+            _draft_dict = dict(self.model_config.get("draft", {}) or {})
+        _draft_cfg = DraftModelConfig(**_draft_dict)
+        validate_draft_config(_draft_cfg, strategy="megatron", engine_config=self.engine_config, rollout_cfg=None)
+        self.draft_plugin = MegatronDraftTrainerPlugin(_draft_cfg)
+        if _draft_cfg.enable:
+            self.draft_plugin.setup(self.module, self.model_config.hf_config, params_dtype=self.param_dtype)
+
         # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
         if self.engine_config.forward_only:
             self.optimizer = None
@@ -473,6 +489,8 @@ class MegatronEngine(BaseEngine):
         Zero out gradients of all parameters before starting a new backward pass.
         """
         self.optimizer.zero_grad()
+        if getattr(self, "draft_plugin", None) is not None:
+            self.draft_plugin.zero_grad()
         # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
         for chunk in self.module:
             # if use distributed optimizer, zero grad buffer will be handled by optimizer
@@ -486,6 +504,9 @@ class MegatronEngine(BaseEngine):
             grad_norm (float): The norm of the gradients before clipping or update.
         """
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+
+        if getattr(self, "draft_plugin", None) is not None:
+            self.draft_plugin.step()
 
         if update_successful:
             # allgather already execute in optimizer.step in new megatron
@@ -579,6 +600,8 @@ class MegatronEngine(BaseEngine):
         self.checkpoint_mananager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
+        if getattr(self, "draft_plugin", None) is not None:
+            self.draft_plugin.save_checkpoint(local_path)
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
@@ -599,6 +622,8 @@ class MegatronEngine(BaseEngine):
         self.checkpoint_mananager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+        if getattr(self, "draft_plugin", None) is not None:
+            self.draft_plugin.load_checkpoint(local_path)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
         if self._is_offload_optimizer:
@@ -748,6 +773,10 @@ class MegatronEngine(BaseEngine):
             from verl.utils.modelopt import export_qat_weights
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
+
+        if getattr(self, "draft_plugin", None) is not None:
+            # append trainer-owned eagle3 drafter weights under the 'draft.' prefix
+            per_tensor_param = self.draft_plugin.chain_draft_export(per_tensor_param)
 
         return per_tensor_param, peft_config
 
@@ -914,10 +943,18 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
             def logits_processor(logits, label, temperature):
                 assert logits.shape[:2] == label.shape[:2]
+                _draft = getattr(self, "draft_plugin", None)
+                _draft_on = _draft is not None and _draft.enabled
+                if _draft_on and not _draft.cfg.temperature_scaled_teacher:
+                    # eagle3 teacher uses pre-temperature raw logits (NeMo-RL parity);
+                    # bshd layout here: logits [b, s, V/tp] -> seq_dim=1
+                    _draft.stash_teacher_from_logits_processor(logits, seq_dim=1)
                 # avoid non-positive temperature such as padding
                 temperature[temperature <= 0] = 1e-8
                 assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
                 logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
+                if _draft_on and _draft.cfg.temperature_scaled_teacher:
+                    _draft.stash_teacher_from_logits_processor(logits, seq_dim=1)
                 ret = {}
                 # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
                 if calculate_sum_pi_squared:
@@ -953,18 +990,31 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "response_attention_mask": response_attention_mask,
             }
 
-            output = forward_fn(
-                model,
-                input_ids,
-                multi_modal_inputs,
-                logits_processor=logits_processor,
-                logits_processor_args=logits_processor_args,
-                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
-                pad_token_id=self.model_config.tokenizer.pad_token_id,
-                data_format=data_format,
-                mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
-                local_cp_size=local_cp_size,
-            )
+            _draft = getattr(self, "draft_plugin", None)
+            if _draft is not None and _draft.enabled:
+                _gvt = tu.get_non_tensor_data(batch, key="batch_num_tokens", default=None)
+                _draft.begin_microbatch(
+                    loss_mask=loss_mask,
+                    global_valid_toks=torch.tensor(float(_gvt), device=get_device_id()) if _gvt else None,
+                )
+
+            with (_draft.capture_context() if _draft is not None else contextlib.nullcontext()):
+                output = forward_fn(
+                    model,
+                    input_ids,
+                    multi_modal_inputs,
+                    logits_processor=logits_processor,
+                    logits_processor_args=logits_processor_args,
+                    vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+                    pad_token_id=self.model_config.tokenizer.pad_token_id,
+                    data_format=data_format,
+                    mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
+                    local_cp_size=local_cp_size,
+                )
+
+            if _draft is not None and _draft.enabled:
+                # PP collective (capture gather); owner stage runs the draft forward
+                _draft.run_draft_forward()
 
         # Router replay: record routing decisions for R2 mode
         if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
@@ -990,6 +1040,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
             # TODO(baiyan): How to support hybrid context parallel with dp_group,
             # now the dp_group is not used, so just leave it as is, but what if we need to use it?
             loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+            if getattr(self, "draft_plugin", None) is not None:
+                # eagle3: loss += loss_weight * soft_CE(student, detached teacher);
+                # added before the num_micro_batch rescale so the draft loss gets
+                # the same mcore schedule scaling as the policy loss.
+                loss = self.draft_plugin.add_draft_loss(loss, metrics)
             # scale loss by num_micro_batch because megatron will scale loss
             # by n_micro_batch inside pp schedule
             scaled_loss = loss * data["num_micro_batch"]

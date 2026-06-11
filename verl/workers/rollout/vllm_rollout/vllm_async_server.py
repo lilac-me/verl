@@ -304,6 +304,17 @@ class vLLMHttpServer:
                 args.get("speculative_config"),
             )
 
+        _spec_cfg = getattr(self.config, "speculative", None)
+        if _spec_cfg is not None and getattr(_spec_cfg, "method", None) == "eagle3":
+            from verl.workers.rollout.vllm_rollout.eagle3_utils import build_eagle3_speculative_config
+
+            args["speculative_config"] = build_eagle3_speculative_config(
+                model=_spec_cfg.model,
+                num_speculative_tokens=_spec_cfg.num_speculative_tokens,
+                draft_tensor_parallel_size=getattr(_spec_cfg, "draft_tensor_parallel_size", 1),
+                engine_speculative_config=args.get("speculative_config"),
+            )
+
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"
