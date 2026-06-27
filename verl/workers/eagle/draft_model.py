@@ -45,6 +45,25 @@ from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.transformer_block import TransformerBlock
 
 
+def _is_npu() -> bool:
+    """True when running on Ascend NPU.
+
+    Uses torch.npu availability directly — this stays correct even after
+    MindSpeed redirects torch.cuda to NPU (which makes torch.cuda.is_available()
+    report True). A genuine CUDA host has no torch.npu, so this returns False
+    there.
+    """
+    try:
+        return bool(torch.npu.is_available())
+    except Exception:
+        return False
+
+
+def _accelerator_available() -> bool:
+    """True if a CUDA GPU or Ascend NPU accelerator is available."""
+    return torch.cuda.is_available() or _is_npu()
+
+
 class EagleModule(MegatronModule):
     def __init__(self, config: TransformerConfig):
         super().__init__(config=config)
@@ -63,7 +82,7 @@ class EagleModule(MegatronModule):
             rotary_base=getattr(config, "rotary_base", 10000),
             rope_scaling=getattr(config, "rope_scaling", False),
             rope_scaling_factor=getattr(config, "rope_scaling_factor", 8.0),
-            use_cpu_initialization=getattr(config, "use_cpu_initialization", not torch.cuda.is_available()),
+            use_cpu_initialization=getattr(config, "use_cpu_initialization", not _accelerator_available()),
         )
         
         self.decoder = TransformerBlock(
@@ -72,9 +91,13 @@ class EagleModule(MegatronModule):
         )
 
         self._embeddings = None
-        # Optional draft-to-target token mapping: mapping[i] = i + d2t[i].
-        # Populated from checkpoint when draft_vocab_size < vocab_size.
-        self.register_buffer("d2t", None, persistent=True)
+        # Draft-to-target token mapping (offset form): target_id = i + d2t[i].
+        # Registered as a real int64 buffer (not None) so it appears in state_dict()
+        # and gets populated by load_state_dict from the Eagle3 checkpoint's `d2t`.
+        # Identity (zeros) when draft_vocab_size == vocab_size.
+        self.register_buffer(
+            "d2t", torch.zeros(config.draft_vocab_size, dtype=torch.long), persistent=True
+        )
 
         last_layer = self.decoder.layers[-1]
         last_layer.register_forward_hook(self._eagle3_layer_forward_hook)
@@ -170,6 +193,21 @@ class EagleDraftModel(MegatronModule):
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # On Ascend NPU, MindSpeed wraps DotProductAttention to inject an
+        # FA-style compressed causal mask whenever attention_mask is None — but
+        # the local (non-fused) attention path does masked_fill_ and cannot
+        # broadcast that compressed mask. Build an explicit [B,1,S,S] causal
+        # mask here so the None branch in MindSpeed's wrapper is never taken.
+        # On GPU we leave attention_mask=None so Megatron's optimized default
+        # causal mask is used.
+        if attention_mask is None and _is_npu():
+            seq_len, batch = hidden_states.shape[0], hidden_states.shape[1]
+            causal = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=hidden_states.device),
+                diagonal=1,
+            )
+            attention_mask = causal.view(1, 1, seq_len, seq_len).expand(batch, 1, seq_len, seq_len)
+
         hidden_states = self.eagle_module.fc(hidden_states)
 
         hidden_states, _ = self.eagle_module(

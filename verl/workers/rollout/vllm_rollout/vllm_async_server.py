@@ -300,8 +300,12 @@ class vLLMHttpServer:
 
         eagle_draft = getattr(self.model_config, "eagle_draft", None)
         if eagle_draft is not None and eagle_draft.enabled and eagle_draft.model_path:
+            # Use the "eagle3" method (not "eagle"): the latter makes vLLM prepend
+            # "Eagle" to the draft architecture (e.g. EagleLlamaForCausalLMEagle3),
+            # which is unsupported. Eagle3 checkpoints expose architectures like
+            # "LlamaForCausalLMEagle3" / "Eagle3LlamaForCausalLM", recognized by eagle3.
             args["speculative_config"] = {
-                "method": "eagle",
+                "method": "eagle3",
                 "model": eagle_draft.model_path,
                 "num_speculative_tokens": eagle_draft.num_speculative_tokens,
             }
@@ -399,6 +403,22 @@ class vLLMHttpServer:
             kwargs["enable_log_requests"] = engine_args.enable_log_requests
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
+
+        # Eagle3: attach a custom StatLogger so spec-decode acceptance counters are
+        # accumulated in this (frontend) process and can be surfaced as a training
+        # metric. Requires stats enabled (disable_log_stats=False keeps the default
+        # loggers too, since vLLM runs custom + default together).
+        eagle_draft = getattr(self.model_config, "eagle_draft", None)
+        if (
+            eagle_draft is not None and getattr(eagle_draft, "enabled", False)
+            and "stat_loggers" in fn_args
+        ):
+            from verl.workers.rollout.vllm_rollout.spec_decode_metrics import make_spec_decode_stat_logger
+            spec_logger = make_spec_decode_stat_logger()
+            if spec_logger is not None:
+                kwargs["stat_loggers"] = [spec_logger]
+                if "disable_log_stats" in fn_args:
+                    kwargs["disable_log_stats"] = False
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
@@ -651,6 +671,18 @@ class vLLMHttpServer:
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
+
+    async def pop_spec_decode_metrics(self) -> dict[str, int]:
+        """Return + reset this server's accumulated Eagle3 spec-decode counters.
+
+        Counts are accumulated by the SpecDecodeStatLogger in this process. Returns
+        zeros if spec decode / the logger is not active.
+        """
+        try:
+            from verl.workers.rollout.vllm_rollout.spec_decode_metrics import pop_spec_decode_accumulator
+            return pop_spec_decode_accumulator()
+        except Exception:
+            return {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.

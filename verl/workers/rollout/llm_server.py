@@ -370,3 +370,34 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def collect_spec_decode_metrics(self) -> dict[str, float]:
+        """Aggregate Eagle3 spec-decode acceptance across all replicas (since last call).
+
+        Returns a metrics dict with keys ``rollout/acceptance_rate``,
+        ``rollout/mean_acceptance_length``, ``rollout/num_draft_tokens``,
+        ``rollout/num_accepted_tokens``. Empty dict if there were no drafts
+        (spec decode disabled / no rollout since last call).
+        """
+        per_replica = await asyncio.gather(
+            *[replica.pop_spec_decode_metrics() for replica in self.rollout_replicas]
+        )
+        drafts = draft_tokens = accepted = 0
+        for d in per_replica:
+            if not d:
+                continue
+            drafts += int(d.get("num_drafts", 0) or 0)
+            draft_tokens += int(d.get("num_draft_tokens", 0) or 0)
+            accepted += int(d.get("num_accepted_tokens", 0) or 0)
+        if draft_tokens == 0 and drafts == 0:
+            return {}
+        metrics = {
+            "rollout/num_draft_tokens": float(draft_tokens),
+            "rollout/num_accepted_tokens": float(accepted),
+        }
+        if draft_tokens > 0:
+            metrics["rollout/acceptance_rate"] = accepted / draft_tokens
+        if drafts > 0:
+            metrics["rollout/mean_acceptance_length"] = 1.0 + accepted / drafts
+        return metrics

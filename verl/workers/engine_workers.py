@@ -199,13 +199,31 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # PP=1, VPP=1 — unwrap the single-element list
             policy_model = policy_model[0]
 
-        device = torch.device("cuda", torch.cuda.current_device())
-        self._eagle_manager = EagleDraftManager.build(
-            policy_model=policy_model,
-            eagle_config=eagle_config,
-            torch_dtype=torch.bfloat16,
-            device=device,
-        )
+        from verl.utils.device import get_device_name, get_device_id
+        device = torch.device(get_device_name(), get_device_id())
+
+        # If policy params are offloaded to CPU (param_offload), Megatron frees
+        # their on-device storage, so the LM-head TP all-gather inside
+        # EagleDraftManager.build would receive a null buffer. Load the policy
+        # params back to the accelerator for the copy, then re-offload.
+        offload_enabled = bool(getattr(self.engine, "is_param_offload_enabled", False))
+        if offload_enabled:
+            from verl.utils.megatron_utils import (
+                load_megatron_model_to_gpu,
+                offload_megatron_model_to_cpu,
+            )
+            load_megatron_model_to_gpu(self.engine.module, load_grad=False)
+
+        try:
+            self._eagle_manager = EagleDraftManager.build(
+                policy_model=policy_model,
+                eagle_config=eagle_config,
+                torch_dtype=torch.bfloat16,
+                device=device,
+            )
+        finally:
+            if offload_enabled:
+                offload_megatron_model_to_cpu(self.engine.module)
 
         if self.loss_fn is not None:
             self.loss_fn = self._eagle_manager.make_loss_wrapper(self.loss_fn)
@@ -444,7 +462,17 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 delta_time=delta_time,
                 forward_only=False,
                 images_seqlens=images_seqlens,
-            ).cpu()
+            )
+            # Merge Eagle3 draft per-layer grad norms (from optimizer_step) into the
+            # step metrics so they're logged to wandb/console. Added AFTER
+            # _postprocess_output so these scalars bypass the DP all-gather that
+            # listifies pre-aggregation metrics — otherwise train_mini_batch's
+            # list-flatten hits `'float' object is not iterable`.
+            if self._eagle_manager is not None:
+                gm = getattr(self._eagle_manager, "last_grad_metrics", {})
+                if gm:
+                    tu.get(final_output, "metrics").update(gm)
+            final_output = final_output.cpu()
         else:
             final_output = None
 
@@ -805,13 +833,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Eagle3 draft weight sync: push updated draft-model parameters to the
         # vLLM Eagle3 proposer so its distribution tracks the evolving policy.
+        # EAGLE_DISABLE_DRAFT_SYNC=1 keeps vLLM's natively-loaded pretrained draft
+        # (diagnostic: isolates whether the Megatron->vLLM export corrupts the draft).
         eagle_manager = getattr(self.actor, "_eagle_manager", None)
-        if eagle_manager is not None:
+        if eagle_manager is not None and os.environ.get("EAGLE_DISABLE_DRAFT_SYNC", "0") != "1":
             draft_weights = eagle_manager.state_dict_for_vllm()
             await self.rollout.update_eagle_draft_weights(
                 draft_weights, global_steps=global_steps
             )
             log_gpu_memory_usage("After update_eagle_draft_weights", logger=logger)
+        elif eagle_manager is not None:
+            logger.info("Eagle3 draft weight sync DISABLED (EAGLE_DISABLE_DRAFT_SYNC=1); "
+                        "vLLM keeps its natively-loaded draft.")
 
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:

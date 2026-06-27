@@ -37,14 +37,16 @@ rank without explicit inter-stage communication.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 
 from megatron.training.utils import unwrap_model
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +56,15 @@ from megatron.training.utils import unwrap_model
 def get_eagle3_aux_hidden_state_layer_indices(num_hidden_layers: int) -> Tuple[int, ...]:
     """Return default aux-layer indices for Eagle3.
 
-    Uses the nemo-rl heuristic: (1, num_hidden_layers // 2 - 1, num_hidden_layers - 4),
-    deduplicated and sorted.
+    Uses vLLM's convention ``(2, num_layers // 2, num_layers - 3)`` — this matches
+    what vLLM/SGLang-trained Eagle3 drafts (e.g. Tengyunw qwen3_8b_eagle3) expect.
+    Empirically this set gives the lowest draft KL on Qwen3-8B; the older nemo
+    heuristic (1, L//2-1, L-4) gave a much higher loss.
     """
     candidates = (
-        1,
-        max(0, num_hidden_layers // 2 - 1),
-        max(1, num_hidden_layers - 4),
+        2,
+        max(0, num_hidden_layers // 2),
+        max(1, num_hidden_layers - 3),
     )
     return tuple(sorted(set(candidates)))
 
@@ -77,6 +81,8 @@ class CapturedStates:
     hidden_states: Optional[torch.Tensor] = None
     # [seq, batch, hidden_size]
     inputs_embeds: Optional[torch.Tensor] = None
+    # [seq, batch, vocab/TP] — vocab-parallel, seq-first; pre-temperature
+    logits: Optional[torch.Tensor] = None
 
 # ---------------------------------------------------------------------------
 # Main capture class
@@ -102,6 +108,7 @@ class HiddenStateCapture:
         self._model = unwrap_model(model)
         self._layers = self._find_layers(self._model)
         self._embed = self._find_embed(self._model)
+        self._output_layer = self._find_output_layer(self._model)
 
         num_layers = len(self._layers)
         self._eagle_aux_hidden_state_layer_ids = (
@@ -139,6 +146,22 @@ class HiddenStateCapture:
             "Cannot locate decoder layers. "
             "Expected model.model.layers (HF) or model.decoder.layers (Mcore)."
         )
+
+    @staticmethod
+    def _find_output_layer(model: nn.Module) -> Optional[nn.Module]:
+        """Locate the LM head / output projection.
+
+        Mcore path: model.output_layer (ColumnParallelLinear, gather_output=False)
+        HF path:    model.lm_head
+        Returns None for tied-embedding models where no separate module exists.
+        """
+        layer = getattr(model, "output_layer", None)
+        if layer is not None and isinstance(layer, nn.Module):
+            return layer
+        layer = getattr(model, "lm_head", None)
+        if layer is not None and isinstance(layer, nn.Module):
+            return layer
+        return None
 
     @staticmethod
     def _find_embed(inner: nn.Module) -> nn.Module:
@@ -183,6 +206,14 @@ class HiddenStateCapture:
             self._captured["embeds"] = output.detach().clone()
         return hook
 
+    def _make_output_layer_hook(self):
+        def hook(_module, _args, output):
+            # Megatron ColumnParallelLinear returns (output_tensor, bias_or_None)
+            logits = output[0] if isinstance(output, tuple) else output
+            if logits is not None and logits.dim() in (2, 3):
+                self._captured["logits"] = logits.detach().clone()
+        return hook
+
     # ------------------------------------------------------------------
     # Hook lifecycle
     # ------------------------------------------------------------------
@@ -204,6 +235,16 @@ class HiddenStateCapture:
                     self._layers[idx].register_forward_hook(self._make_layer_hook(idx))
                 )
 
+        if self._output_layer is not None:
+            self._hooks.append(
+                self._output_layer.register_forward_hook(self._make_output_layer_hook())
+            )
+        else:
+            logger.warning(
+                "Eagle3: policy output_layer not found; teacher logits unavailable. "
+                "Eagle draft loss will be skipped every step."
+            )
+
     def clear_hooks(self) -> None:
         for handle in self._hooks:
             handle.remove()
@@ -213,14 +254,6 @@ class HiddenStateCapture:
     # State assembly
     # ------------------------------------------------------------------
 
-    @contextmanager
-    def capture_context(self):
-        try:
-            self.register_hooks()
-            yield self
-        finally:
-            self.clear_hooks()
-
     def _assemble_captured_states(self) -> CapturedStates:
         """Assemble captured tensors into a CapturedStates container.
 
@@ -228,6 +261,7 @@ class HiddenStateCapture:
         cleared.
         """
         embeds = self._captured.get("embeds")
+        logits = self._captured.get("logits")
 
         hidden_chunks: List[torch.Tensor] = []
         for idx in sorted(self._eagle_aux_hidden_state_layer_ids):
@@ -239,17 +273,14 @@ class HiddenStateCapture:
             return CapturedStates(
                 hidden_states=None,
                 inputs_embeds=embeds,
+                logits=logits,
             )
 
         return CapturedStates(
             hidden_states=torch.cat(hidden_chunks, dim=-1),  # [S, B, N_aux * H]
             inputs_embeds=embeds,
+            logits=logits,
         )
     
     def get_captured_states(self) -> CapturedStates:
         return self._assemble_captured_states()
-    
-
-def get_capture_context(model, eagle_aux_hidden_state_layer_ids=None):
-    capture = HiddenStateCapture(model=model, eagle_aux_hidden_state_layer_ids=eagle_aux_hidden_state_layer_ids)
-    return capture.capture_context(), capture

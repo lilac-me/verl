@@ -282,10 +282,14 @@ class vLLMColocateWorkerExtension:
 
         assert self.device is not None
 
-        # Locate the Eagle3 draft model runner inside vLLM's speculative decode stack
+        # Locate an object whose ``.model`` is the Eagle3 draft (it must expose
+        # ``load_weights``). vLLM v1 / vLLM-Ascend keeps the draft on the model
+        # runner's ``drafter`` (AscendEagleProposer.model); older v0 stacks used a
+        # separate proposer/draft worker. We probe both layouts.
         draft_model_runner = None
         for path in (
-            ("proposer_worker", "model_runner"),
+            ("model_runner", "drafter"),            # vLLM v1 / vLLM-Ascend (proposer.model)
+            ("proposer_worker", "model_runner"),    # legacy v0 layouts
             ("draft_worker", "model_runner"),
             ("eagle_worker", "model_runner"),
             ("_spec_decode_worker", "proposer_worker", "model_runner"),
@@ -295,7 +299,8 @@ class vLLMColocateWorkerExtension:
                 obj = getattr(obj, attr, None)
                 if obj is None:
                     break
-            if obj is not None:
+            # Require a usable .model.load_weights so we don't load into the wrong object.
+            if obj is not None and hasattr(getattr(obj, "model", None), "load_weights"):
                 draft_model_runner = obj
                 break
 
@@ -317,7 +322,8 @@ class vLLMColocateWorkerExtension:
             draft_model_runner.model.load_weights(weights)
 
         receiver.receive_weights(on_bucket_received=_load_draft_bucket)
-        logger.debug("Eagle3 draft weights loaded into vLLM proposer.")
+        logger.debug("Eagle3 draft weights loaded into vLLM proposer (%s).",
+                     type(draft_model_runner.model).__name__)
 
 
 class SuppressSignalInThread:

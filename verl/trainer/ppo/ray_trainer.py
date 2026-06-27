@@ -1425,6 +1425,15 @@ class RayPPOTrainer:
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
 
+                    # Eagle3 speculative-decoding acceptance (rollout/acceptance_rate,
+                    # rollout/mean_acceptance_length, ...) — surfaced like critic/rewards/mean.
+                    try:
+                        spec_metrics = self.llm_server_manager.collect_spec_decode_metrics()
+                        if spec_metrics:
+                            metrics.update(spec_metrics)
+                    except Exception as e:
+                        print(f"[eagle] Failed to collect spec-decode acceptance metrics: {e}")
+
                     gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])

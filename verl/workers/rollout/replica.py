@@ -298,6 +298,19 @@ class RolloutReplica(ABC):
         """Stop profiling on the replica."""
         await asyncio.gather(*[server.stop_profile.remote() for server in self.servers])
 
+    async def pop_spec_decode_metrics(self) -> dict[str, int]:
+        """Sum + reset Eagle3 spec-decode counters across this replica's servers."""
+        per_server = await asyncio.gather(
+            *[server.pop_spec_decode_metrics.remote() for server in self.servers]
+        )
+        agg = {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}
+        for d in per_server:
+            if not d:
+                continue
+            for k in agg:
+                agg[k] += int(d.get(k, 0) or 0)
+        return agg
+
 
 class RolloutReplicaRegistry:
     """Factory for managing rollout replica implementations."""

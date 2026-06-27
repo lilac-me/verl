@@ -61,4 +61,17 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    # On Ascend NPU, the CANN python bindings (e.g. `acl`) and shared libs live on
+    # PYTHONPATH / LD_LIBRARY_PATH. Force-propagate them through the Ray runtime_env
+    # so spawned workers — and the vLLM-ascend EngineCore sub-subprocesses — can
+    # import `acl`. Without this they fail with ModuleNotFoundError: No module named 'acl'.
+    try:
+        from verl.utils.device import is_npu_available
+        if is_npu_available:
+            for key in ("PYTHONPATH", "LD_LIBRARY_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_OPP_PATH", "ASCEND_AICPU_PATH"):
+                val = os.environ.get(key)
+                if val:
+                    runtime_env["env_vars"][key] = val
+    except Exception:
+        pass
     return runtime_env

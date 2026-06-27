@@ -96,6 +96,43 @@ mtp:
   method: mtp
   num_speculative_tokens: 1
 
+# Eagle3 online draft-model training (Megatron backend)
+eagle_draft:
+
+  _target_: verl.workers.config.EagleDraftConfig
+
+  # whether to enable Eagle3 online draft training
+  enabled: False
+
+  # path to a pretrained HuggingFace Eagle3 checkpoint
+  model_path: null
+
+  # number of draft tokens proposed per decoding step (passed to vLLM speculative_config)
+  num_speculative_tokens: 1
+
+  # scaling factor for the distillation loss: total = policy_loss + loss_weight * draft_loss
+  loss_weight: 0.1
+
+  # aux hidden-state layer ids (auto-populated from the Eagle config.json when null)
+  eagle_aux_hidden_state_layer_ids: null
+
+  # draft vocab size (auto-populated from the Eagle config.json when null)
+  draft_vocab_size: null
+
+  # optimizer for the draft model (separate from the policy optimizer)
+  optimizer:
+
+    _target_: verl.workers.config.EagleDraftConfig._OptimizerConfig
+
+    # learning rate for the draft model
+    # NB: write as 1.0e-4 (not 1e-4). YAML 1.1 (PyYAML) parses an exponent without a
+    # decimal point as a STRING, which would reach AdamW as "1e-4". OmegaConf/Hydra
+    # happens to coerce it to float, but the explicit form is loader-agnostic.
+    lr: 1.0e-4
+
+    # weight decay for the draft model
+    weight_decay: 0.0
+
 # LoRA (Low-Rank Adaptation) configuration for parameter-efficient fine-tuning
 lora:
   # LoRA type: "lora", "vlm_lora", "canonical_lora", or "dora"
