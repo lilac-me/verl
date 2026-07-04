@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -746,6 +747,35 @@ def copy_policy_lm_head_to_draft(
         )
 
 
+_SYNC_DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
+
+
+def _sync_export_dtype() -> torch.dtype:
+    """Dtype for draft weights shipped to vLLM (env ``EAGLE_SYNC_DTYPE``, default bf16).
+
+    The draft trains/runs in bf16 and vLLM casts to each param's own dtype on load, so
+    exporting bf16 is LOSSLESS vs the source while halving the per-step ZMQ transfer
+    relative to the previous fp32 export. Set ``EAGLE_SYNC_DTYPE=fp32`` to restore the
+    old behavior (diagnostic / bit-exact comparison).
+    """
+    name = os.environ.get("EAGLE_SYNC_DTYPE", "bf16").strip().lower()
+    dtype = _SYNC_DTYPE_MAP.get(name)
+    if dtype is None:
+        logger.warning(
+            "[eagle] unknown EAGLE_SYNC_DTYPE=%r; falling back to bf16. Valid: %s",
+            name, sorted(_SYNC_DTYPE_MAP),
+        )
+        return torch.bfloat16
+    return dtype
+
+
 def export_eagle_weights_to_hf(draft_model: nn.Module) -> list[tuple[str, torch.Tensor]]:
     """Export the Eagle3 draft to the checkpoint (``midlayer.*``) naming that
     vLLM's ``LlamaForCausalLMEagle3.load_weights`` consumes.
@@ -763,15 +793,19 @@ def export_eagle_weights_to_hf(draft_model: nn.Module) -> list[tuple[str, torch.
     source_state = unwrapped_model.state_dict()
     config = unwrapped_model.config
 
-    def cpu32(t: torch.Tensor) -> torch.Tensor:
-        return t.detach().cpu().float()
+    # Resolve once per export (env EAGLE_SYNC_DTYPE, default bf16 — lossless vs the bf16
+    # draft, halves the ZMQ transfer vs the old fp32 export). See _sync_export_dtype.
+    sync_dtype = _sync_export_dtype()
+
+    def to_sync(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().cpu().to(sync_dtype)
 
     out: list[tuple[str, torch.Tensor]] = []
 
-    out.append(("fc.weight", cpu32(source_state["eagle_module.fc.weight"])))
+    out.append(("fc.weight", to_sync(source_state["eagle_module.fc.weight"])))
     # enorm (embedding norm) -> midlayer.input_layernorm
     if "eagle_module.enorm.weight" in source_state:
-        out.append(("midlayer.input_layernorm.weight", cpu32(source_state["eagle_module.enorm.weight"])))
+        out.append(("midlayer.input_layernorm.weight", to_sync(source_state["eagle_module.enorm.weight"])))
 
     q_dim = config.num_attention_heads * config.kv_channels
     kv_dim = config.num_query_groups * config.kv_channels
@@ -780,9 +814,9 @@ def export_eagle_weights_to_hf(draft_model: nn.Module) -> list[tuple[str, torch.
     lp = "eagle_module.decoder.layers.0"
     # decoder input_layernorm (hidden norm) -> midlayer.hidden_norm
     if f"{lp}.input_layernorm.weight" in source_state:
-        out.append(("midlayer.hidden_norm.weight", cpu32(source_state[f"{lp}.input_layernorm.weight"])))
+        out.append(("midlayer.hidden_norm.weight", to_sync(source_state[f"{lp}.input_layernorm.weight"])))
     if f"{lp}.pre_mlp_layernorm.weight" in source_state:
-        out.append(("midlayer.post_attention_layernorm.weight", cpu32(source_state[f"{lp}.pre_mlp_layernorm.weight"])))
+        out.append(("midlayer.post_attention_layernorm.weight", to_sync(source_state[f"{lp}.pre_mlp_layernorm.weight"])))
 
     # De-interleave Megatron's per-group linear_qkv back to per-head q/k/v. vLLM's
     # LlamaForCausalLMEagle3 stacks these into ITS OWN (flat [q|k|v]) qkv_proj on load,
@@ -791,23 +825,23 @@ def export_eagle_weights_to_hf(draft_model: nn.Module) -> list[tuple[str, torch.
         source_state[f"{lp}.self_attention.linear_qkv.weight"], q_dim, kv_dim, config.kv_channels
     )
     out.extend([
-        ("midlayer.self_attn.q_proj.weight", cpu32(q)),
-        ("midlayer.self_attn.k_proj.weight", cpu32(k)),
-        ("midlayer.self_attn.v_proj.weight", cpu32(v)),
-        ("midlayer.self_attn.o_proj.weight", cpu32(_gather_tp_weight(source_state[f"{lp}.self_attention.linear_proj.weight"], dim=1))),
+        ("midlayer.self_attn.q_proj.weight", to_sync(q)),
+        ("midlayer.self_attn.k_proj.weight", to_sync(k)),
+        ("midlayer.self_attn.v_proj.weight", to_sync(v)),
+        ("midlayer.self_attn.o_proj.weight", to_sync(_gather_tp_weight(source_state[f"{lp}.self_attention.linear_proj.weight"], dim=1))),
     ])
 
     gate, up = _get_tp_gate_up_weight(source_state[f"{lp}.mlp.linear_fc1.weight"], config.ffn_hidden_size)
     out.extend([
-        ("midlayer.mlp.gate_proj.weight", cpu32(gate)),
-        ("midlayer.mlp.up_proj.weight",   cpu32(up)),
-        ("midlayer.mlp.down_proj.weight",  cpu32(_gather_tp_weight(source_state[f"{lp}.mlp.linear_fc2.weight"], dim=1))),
+        ("midlayer.mlp.gate_proj.weight", to_sync(gate)),
+        ("midlayer.mlp.up_proj.weight",   to_sync(up)),
+        ("midlayer.mlp.down_proj.weight",  to_sync(_gather_tp_weight(source_state[f"{lp}.mlp.linear_fc2.weight"], dim=1))),
     ])
 
     if "eagle_module.decoder.final_layernorm.weight" in source_state:
-        out.append(("norm.weight", cpu32(source_state["eagle_module.decoder.final_layernorm.weight"])))
+        out.append(("norm.weight", to_sync(source_state["eagle_module.decoder.final_layernorm.weight"])))
 
-    out.append(("lm_head.weight", cpu32(_gather_tp_weight(source_state["eagle_module.eagle_output_layer.weight"], dim=0))))
+    out.append(("lm_head.weight", to_sync(_gather_tp_weight(source_state["eagle_module.eagle_output_layer.weight"], dim=0))))
     # d2t (vLLM renames to draft_id_to_target_id). Critical: under load_format=dummy
     # vLLM's draft d2t is random, so it MUST be synced for the vocab remap to work.
     if "eagle_module.d2t" in source_state:

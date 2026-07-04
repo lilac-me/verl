@@ -107,8 +107,11 @@ eagle_draft:
   # path to a pretrained HuggingFace Eagle3 checkpoint
   model_path: null
 
-  # number of draft tokens proposed per decoding step (passed to vLLM speculative_config)
-  num_speculative_tokens: 1
+  # number of draft tokens proposed per decoding step (passed to vLLM speculative_config).
+  # default 3 to match the working references (nemo-rl / verl-SpeCo eagle3); k=1 often makes
+  # speculative decoding net-negative because the per-step draft+verify overhead outweighs the
+  # single token gained when acceptance is < 100%.
+  num_speculative_tokens: 3
 
   # scaling factor for the distillation loss: total = policy_loss + loss_weight * draft_loss
   loss_weight: 0.1

@@ -85,8 +85,11 @@ class EagleDraftConfig(BaseConfig):
     enabled: bool = False
     # Path to a pretrained HuggingFace Eagle3 checkpoint
     model_path: Optional[str] = None
-    # Number of draft tokens proposed per decoding step (passed to vLLM speculative_config)
-    num_speculative_tokens: int = 1
+    # Number of draft tokens proposed per decoding step (passed to vLLM speculative_config).
+    # Default 3 to match the working references (nemo-rl eagle3 recipe, verl-SpeCo eagle3
+    # examples): with Eagle3, k=1 caps the achievable speedup and, at <100% acceptance, the
+    # per-step draft+verify overhead can make speculative decoding net-negative vs plain decode.
+    num_speculative_tokens: int = 3
     # Scaling factor λ: total_loss = policy_loss + λ * draft_loss
     loss_weight: float = 0.1
     eagle_aux_hidden_state_layer_ids: Optional[Any] = None
